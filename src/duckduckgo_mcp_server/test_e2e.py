@@ -11,25 +11,26 @@ import pytest_asyncio
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from duckduckgo_mcp_server.server import mcp as mcp_app
+from duckduckgo_mcp_server import server as searcher_module
 
 
 @pytest.fixture
 def ddg_html_factory():
-    """Build minimal DDG-like HTML pages."""
+    """Build minimal DDG Lite HTML pages."""
 
     def _build(results):
-        items = []
+        rows = []
         for r in results:
             snippet_html = ""
             if r.get("snippet"):
-                snippet_html = f'<a class="result__snippet">{r["snippet"]}</a>'
-            items.append(
-                f'<div class="result">'
-                f'  <h2 class="result__title"><a href="{r["href"]}">{r["title"]}</a></h2>'
+                snippet_html = f'<td class="result-snippet">{r["snippet"]}</td>'
+            rows.append(
+                f'<tr>'
+                f'  <td><a class="result-link" href="{r["href"]}">{r["title"]}</a></td>'
                 f"  {snippet_html}"
-                f"</div>"
+                f"</tr>"
             )
-        return f"<html><body>{''.join(items)}</body></html>"
+        return f"<html><body><table>{''.join(rows)}</table></body></html>"
 
     return _build
 
@@ -102,10 +103,9 @@ async def test_search_tool_e2e(ddg_html_factory):
 
     mock_client = AsyncMock()
     mock_client.post = AsyncMock(return_value=mock_resp)
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.is_closed = False
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
+    with patch.object(searcher_module.searcher, "_get_client", return_value=mock_client):
         async with create_connected_server_and_client_session(mcp_app) as client:
             result = await client.call_tool("search", {"query": "e2e test"})
             text = result.content[0].text
@@ -139,10 +139,9 @@ async def test_fetch_content_tool_lists_backend_in_schema():
 async def test_search_tool_handles_errors():
     mock_client = AsyncMock()
     mock_client.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.is_closed = False
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
+    with patch.object(searcher_module.searcher, "_get_client", return_value=mock_client):
         async with create_connected_server_and_client_session(mcp_app) as client:
             result = await client.call_tool("search", {"query": "timeout test"})
             text = result.content[0].text

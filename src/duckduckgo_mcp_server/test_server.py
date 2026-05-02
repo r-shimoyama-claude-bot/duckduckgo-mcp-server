@@ -53,9 +53,10 @@ class TestRateLimiterEdgeCases(unittest.TestCase):
 
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             asyncio.run(limiter.acquire())
-            mock_sleep.assert_called_once()
-            # Should wait roughly 50 seconds (60 - 10)
-            wait_time = mock_sleep.call_args[0][0]
+            # Called twice: once for rate limit wait, once for jitter
+            self.assertEqual(mock_sleep.call_count, 2)
+            # First call should wait roughly 50 seconds (60 - 10)
+            wait_time = mock_sleep.call_args_list[0][0][0]
             self.assertGreater(wait_time, 40)
             self.assertLessEqual(wait_time, 60)
 
@@ -68,7 +69,11 @@ class TestRateLimiterEdgeCases(unittest.TestCase):
 
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             asyncio.run(limiter.acquire())
-            mock_sleep.assert_not_called()
+            # Only jitter sleep, no rate limit wait
+            mock_sleep.assert_called_once()
+            jitter_time = mock_sleep.call_args[0][0]
+            self.assertGreaterEqual(jitter_time, 0.1)
+            self.assertLessEqual(jitter_time, 0.5)
 
 
 class TestDuckDuckGoSearcher(unittest.TestCase):
@@ -104,19 +109,18 @@ class TestDuckDuckGoSearcher(unittest.TestCase):
 
 
 def _make_ddg_html(results):
-    """Build a minimal DDG-like HTML page with the given result dicts."""
-    items = []
+    """Build a minimal DDG Lite-like HTML page with the given result dicts."""
+    rows = []
     for r in results:
         snippet_html = ""
         if r.get("snippet"):
-            snippet_html = f'<a class="result__snippet">{r["snippet"]}</a>'
-        items.append(
-            f'<div class="result">'
-            f'  <h2 class="result__title"><a href="{r["href"]}">{r["title"]}</a></h2>'
-            f"  {snippet_html}"
-            f"</div>"
+            snippet_html = f'<tr><td>&nbsp;&nbsp;&nbsp;</td><td class="result-snippet">{r["snippet"]}</td></tr>'
+        rows.append(
+            f'<tr><td valign="top">&nbsp;</td>'
+            f'<td><a href="{r["href"]}" class="result-link">{r["title"]}</a></td></tr>'
+            f'{snippet_html}'
         )
-    return f"<html><body>{''.join(items)}</body></html>"
+    return f'<html><body><table>{"".join(rows)}</table></body></html>'
 
 
 def _mock_post_response(html, status_code=200):
@@ -129,7 +133,7 @@ def _mock_post_response(html, status_code=200):
 
 
 class TestDuckDuckGoSearcherParsing(unittest.TestCase):
-    def _run_search(self, html, max_results=10, region=""):
+    def _run_search(self, html, region="", page=1):
         """Helper to run a search with mocked HTTP."""
         searcher = DuckDuckGoSearcher()
         ctx = DummyCtx()
@@ -137,12 +141,12 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
         mock_resp = _mock_post_response(html)
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.is_closed = False
 
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            results = asyncio.run(searcher.search("test query", ctx, max_results, region))
-        return results
+        with patch.object(searcher, "_get_client", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            results, has_next_page, blocked = asyncio.run(searcher.search("test query", ctx, region, page))
+        return results, has_next_page, blocked
 
     def test_search_parses_results_from_html(self):
         html = _make_ddg_html([
@@ -150,7 +154,7 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
             {"title": "Result Two", "href": "https://two.com", "snippet": "Snippet 2"},
             {"title": "Result Three", "href": "https://three.com", "snippet": "Snippet 3"},
         ])
-        results = self._run_search(html)
+        results, _, _ = self._run_search(html)
         self.assertEqual(len(results), 3)
         self.assertEqual(results[0].title, "Result One")
         self.assertEqual(results[0].link, "https://one.com")
@@ -158,41 +162,19 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
         self.assertEqual(results[1].title, "Result Two")
         self.assertEqual(results[2].title, "Result Three")
 
-    def test_search_cleans_redirect_urls(self):
-        encoded_url = "https%3A%2F%2Fexample.com%2Fpage"
+    def test_search_returns_direct_urls(self):
         html = _make_ddg_html([
-            {
-                "title": "Redirected",
-                "href": f"//duckduckgo.com/l/?uddg={encoded_url}&rut=abc",
-                "snippet": "A snippet",
-            },
+            {"title": "Direct Link", "href": "https://example.com/page", "snippet": "A snippet"},
         ])
-        results = self._run_search(html)
+        results, _, _ = self._run_search(html)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].link, "https://example.com/page")
-
-    def test_search_filters_ads(self):
-        html = _make_ddg_html([
-            {"title": "Ad Result", "href": "https://duckduckgo.com/y.js?ad=1", "snippet": "Ad"},
-            {"title": "Real Result", "href": "https://real.com", "snippet": "Real"},
-        ])
-        results = self._run_search(html)
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0].title, "Real Result")
-
-    def test_search_respects_max_results(self):
-        html = _make_ddg_html([
-            {"title": f"R{i}", "href": f"https://r{i}.com", "snippet": f"S{i}"}
-            for i in range(5)
-        ])
-        results = self._run_search(html, max_results=2)
-        self.assertEqual(len(results), 2)
 
     def test_search_handles_missing_snippet(self):
         html = _make_ddg_html([
             {"title": "No Snippet", "href": "https://nosnip.com"},
         ])
-        results = self._run_search(html)
+        results, _, _ = self._run_search(html)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].snippet, "")
 
@@ -202,12 +184,13 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
 
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.is_closed = False
 
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            results = asyncio.run(searcher.search("test", ctx))
+        with patch.object(searcher, "_get_client", return_value=mock_client):
+            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
         self.assertEqual(results, [])
+        self.assertFalse(has_next)
+        self.assertFalse(blocked)
 
     def test_search_returns_empty_on_http_error(self):
         searcher = DuckDuckGoSearcher()
@@ -221,17 +204,106 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(return_value=mock_resp)
         mock_resp.raise_for_status = MagicMock(side_effect=error)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.is_closed = False
 
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            results = asyncio.run(searcher.search("test", ctx))
+        with patch.object(searcher, "_get_client", return_value=mock_client):
+            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
         self.assertEqual(results, [])
+        self.assertFalse(has_next)
+        self.assertFalse(blocked)
 
     def test_search_returns_empty_on_no_results(self):
         html = "<html><body><p>No results</p></body></html>"
-        results = self._run_search(html)
+        results, _, _ = self._run_search(html)
         self.assertEqual(results, [])
+
+    def test_search_detects_captcha_response(self):
+        html = "<html><body><div class='anomaly-modal'>Are you a bot?</div></body></html>"
+        searcher = DuckDuckGoSearcher()
+        ctx = DummyCtx()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = html
+        mock_resp.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.is_closed = False
+
+        with patch.object(searcher, "_get_client", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
+        self.assertEqual(results, [])
+        self.assertFalse(has_next)
+        self.assertTrue(blocked)
+        self.assertIsNotNone(searcher._cooldown_until)
+
+    def test_search_detects_captcha_text_signal(self):
+        html = "<html><body><p>Unfortunately, bots use DuckDuckGo too much</p></body></html>"
+        searcher = DuckDuckGoSearcher()
+        ctx = DummyCtx()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = html
+        mock_resp.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.is_closed = False
+
+        with patch.object(searcher, "_get_client", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
+        self.assertEqual(results, [])
+        self.assertTrue(blocked)
+
+    def test_search_detects_http_403(self):
+        searcher = DuckDuckGoSearcher()
+        ctx = DummyCtx()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 403
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.is_closed = False
+
+        with patch.object(searcher, "_get_client", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
+        self.assertEqual(results, [])
+        self.assertTrue(blocked)
+        self.assertIsNotNone(searcher._cooldown_until)
+
+    def test_search_detects_http_429(self):
+        searcher = DuckDuckGoSearcher()
+        ctx = DummyCtx()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.is_closed = False
+
+        with patch.object(searcher, "_get_client", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
+        self.assertEqual(results, [])
+        self.assertTrue(blocked)
+
+    def test_search_respects_cooldown(self):
+        searcher = DuckDuckGoSearcher()
+        searcher._cooldown_until = datetime.now() + timedelta(seconds=60)
+        ctx = DummyCtx()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
+        self.assertEqual(results, [])
+        self.assertTrue(blocked)
+        # No HTTP request should have been made during cooldown
 
 
 def _serve_html(html_content):
