@@ -124,7 +124,7 @@ class DuckDuckGoSearcher:
             safe_search: SafeSearch filtering mode (STRICT/MODERATE/OFF) - fixed at startup
             default_region: Default region code (e.g., 'us-en', 'cn-zh', 'wt-wt' for no region)
         """
-        self.rate_limiter = RateLimiter(requests_per_minute=60)
+        self.rate_limiter = RateLimiter(requests_per_minute=30)
         self.safe_search = safe_search
         self.default_region = default_region
         self._vqd_cache: Dict[str, str] = {}
