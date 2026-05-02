@@ -39,6 +39,7 @@ def _make_searcher(**kwargs):
     """Create a DuckDuckGoSearcher with primp disabled so tests use httpx mocks."""
     s = DuckDuckGoSearcher(**kwargs)
     s._primp_available = False
+    s._rotator = None
     return s
 
 
@@ -762,4 +763,95 @@ class TestProxyRotator(unittest.TestCase):
     def test_from_env_returns_none_when_empty(self):
         with patch.dict(os.environ, {"DDG_PROXIES": ""}):
             self.assertIsNone(ProxyRotator.from_env())
+
+
+class TestAcceptLanguage(unittest.TestCase):
+    def test_region_jp_ja(self):
+        self.assertEqual(
+            DuckDuckGoSearcher._accept_language_for_region("jp-ja"),
+            "ja-JP,ja;q=0.5",
+        )
+
+    def test_region_us_en(self):
+        self.assertEqual(
+            DuckDuckGoSearcher._accept_language_for_region("us-en"),
+            "en-US,en;q=0.5",
+        )
+
+    def test_region_de_de(self):
+        self.assertEqual(
+            DuckDuckGoSearcher._accept_language_for_region("de-de"),
+            "de-DE,de;q=0.5",
+        )
+
+    def test_empty_region_returns_default(self):
+        self.assertEqual(
+            DuckDuckGoSearcher._accept_language_for_region(""),
+            "en-US,en;q=0.5",
+        )
+
+    def test_no_dash_returns_default(self):
+        self.assertEqual(
+            DuckDuckGoSearcher._accept_language_for_region("en"),
+            "en-US,en;q=0.5",
+        )
+
+    def test_unknown_lang_falls_back(self):
+        self.assertEqual(
+            DuckDuckGoSearcher._accept_language_for_region("wt-wt"),
+            "en-US,en;q=0.5",
+        )
+
+    def test_build_headers_includes_accept_language_for_region(self):
+        searcher = _make_searcher()
+        headers = searcher._build_headers("jp-ja")
+        self.assertEqual(headers["Accept-Language"], "ja-JP,ja;q=0.5")
+
+    def test_build_headers_default_accept_language(self):
+        searcher = _make_searcher()
+        headers = searcher._build_headers()
+        self.assertEqual(headers["Accept-Language"], "en-US,en;q=0.5")
+
+
+class TestPrimpSessionManagement(unittest.TestCase):
+    def test_reset_primp_session_clears_client(self):
+        searcher = DuckDuckGoSearcher()
+        searcher._primp_available = True
+        searcher._primp_client = MagicMock()
+        searcher._primp_request_count = 5
+        searcher._primp_proxy = "http://old:1234"
+        searcher._reset_primp_session()
+        self.assertIsNone(searcher._primp_client)
+        self.assertIsNone(searcher._primp_proxy)
+        self.assertEqual(searcher._primp_request_count, 0)
+
+    def test_primp_client_built_when_none(self):
+        """_get_primp_client should build a new client if none exists."""
+        searcher = DuckDuckGoSearcher()
+        searcher._primp_available = True
+        searcher._primp_client = None
+        client = searcher._get_primp_client()
+        self.assertIsNotNone(client)
+
+    def test_primp_client_rotated_after_interval(self):
+        """After session_rotation_interval requests, client should be rebuilt."""
+        searcher = DuckDuckGoSearcher()
+        searcher._primp_available = True
+        searcher._session_rotation_interval = 2
+        first = searcher._get_primp_client()
+        searcher._primp_request_count = 2
+        second = searcher._get_primp_client()
+        self.assertIsNot(first, second)
+
+    def test_primp_client_rebuilt_on_proxy_change(self):
+        """Client should be rebuilt when proxy changes, even if session is fresh."""
+        searcher = DuckDuckGoSearcher()
+        searcher._primp_available = True
+        first = searcher._get_primp_client("http://a:1")
+        # Same proxy → reused
+        reused = searcher._get_primp_client("http://a:1")
+        self.assertIs(first, reused)
+        # Different proxy → rebuilt
+        second = searcher._get_primp_client("http://b:2")
+        self.assertIsNot(first, second)
 

@@ -22,9 +22,20 @@ venv/
 
 # IDE
 .idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
 
 # Type checkers
 .mypy_cache/
 
 # Serena MCP
 .serena/
+
+# Claude Code
+.claude/

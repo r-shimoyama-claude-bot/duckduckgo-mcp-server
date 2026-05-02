@@ -8,6 +8,7 @@ import sys
 import traceback
 import asyncio
 import argparse
+from pathlib import Path
 from datetime import datetime, timedelta
 import time
 import re
@@ -93,6 +94,24 @@ class ProxyRotator:
         return self._target_interval / count
 
 
+def _load_dotenv():
+    """Load .env from the project root (where pyproject.toml lives)."""
+    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 class DuckDuckGoSearcher:
     DEFAULT_BASE_URL = "https://lite.duckduckgo.com/lite/"
     RESULTS_PER_PAGE = 10
@@ -133,16 +152,71 @@ class DuckDuckGoSearcher:
         self._base_url = os.getenv("DDG_BASE_URL", self.DEFAULT_BASE_URL)
         self._rotator = ProxyRotator.from_env()
         self._current_proxy: Optional[str] = None
+        self._primp_client: Optional[Any] = None
+        self._primp_request_count = 0
+        self._primp_proxy: Optional[str] = None
+        self._primp_custom_headers: Dict[str, str] = {}
         try:
             import primp  # noqa: F401
             self._primp_available = True
         except ImportError:
             self._primp_available = False
 
-    def _build_headers(self) -> Dict[str, str]:
+    # Known ISO 639-1 language codes that DDG uses in kl={country}-{lang} format.
+    _KNOWN_LANGS = frozenset({
+        "en", "ja", "zh", "ko", "de", "fr", "es", "pt", "it", "nl",
+        "ru", "pl", "tr", "th", "vi", "ar", "hi", "bn", "id", "ms",
+        "cs", "da", "fi", "el", "he", "hu", "nb", "ro", "sk", "sv",
+        "uk", "bg", "hr", "lt", "lv", "et", "sl", "sr", "ca", "eu",
+    })
+
+    @classmethod
+    def _accept_language_for_region(cls, region: str) -> str:
+        """Convert DDG region (e.g. 'jp-ja') to Accept-Language header ('ja-JP,ja;q=0.5').
+
+        DDG uses kl={country}-{language}, but Accept-Language uses {language}-{COUNTRY}.
+        Unknown language codes (e.g. 'wt') fall back to 'en-US,en;q=0.5'.
+        """
+        if not region or "-" not in region:
+            return "en-US,en;q=0.5"
+        parts = region.lower().split("-", 1)
+        if len(parts) != 2:
+            return "en-US,en;q=0.5"
+        country, lang = parts
+        if lang not in cls._KNOWN_LANGS:
+            return "en-US,en;q=0.5"
+        return f"{lang}-{country.upper()},{lang};q=0.5"
+
+    def _build_headers(self, region: str = "") -> Dict[str, str]:
         headers = dict(self._BASE_HEADERS)
         headers["User-Agent"] = random.choice(self._USER_AGENTS)
+        if region:
+            headers["Accept-Language"] = self._accept_language_for_region(region)
         return headers
+
+    def _build_primp_client(self, proxy: Optional[str] = None) -> Any:
+        import primp
+        client = primp.Client(
+            impersonate="random",
+            impersonate_os="random",
+            timeout=30,
+            proxy=proxy,
+        )
+        if self._primp_custom_headers:
+            client.headers_update(self._primp_custom_headers)
+        return client
+
+    def _get_primp_client(self, proxy: Optional[str] = None) -> Any:
+        if self._primp_client is None or self._primp_proxy != proxy or self._primp_request_count >= self._session_rotation_interval:
+            self._primp_client = self._build_primp_client(proxy)
+            self._primp_proxy = proxy
+            self._primp_request_count = 0
+        return self._primp_client
+
+    def _reset_primp_session(self):
+        self._primp_client = None
+        self._primp_proxy = None
+        self._primp_request_count = 0
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -154,6 +228,7 @@ class DuckDuckGoSearcher:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
         self._client = None
+        self._reset_primp_session()
 
     async def _maybe_rotate_session(self):
         self._request_count += 1
@@ -163,7 +238,8 @@ class DuckDuckGoSearcher:
     async def close(self):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
-            self._client = None
+        self._client = None
+        self._primp_client = None
 
     def _parse_pagination(self, soup: BeautifulSoup) -> tuple[Optional[str], bool]:
         next_form = soup.find("form", class_="next_form")
@@ -226,17 +302,18 @@ class DuckDuckGoSearcher:
         self._current_proxy = proxy
 
         if self._primp_available:
-            import primp
+            # primp handles TLS fingerprint, User-Agent, Accept-Encoding,
+            # header ordering automatically. Only send content-specific headers.
+            safe_headers = {
+                k: v for k, v in headers.items()
+                if k.lower() not in ("user-agent", "accept-encoding", "referer")
+            }
+            self._primp_custom_headers = safe_headers
 
             def _sync_request():
-                kwargs = {"impersonate": "random", "impersonate_os": "random", "timeout": 30}
-                if proxy:
-                    kwargs["proxy"] = proxy
-                client = primp.Client(**kwargs)
-                safe_headers = {k: v for k, v in headers.items() if k.lower() != "user-agent"}
-                if safe_headers:
-                    client.headers_update(safe_headers)
+                client = self._get_primp_client(proxy)
                 resp = client.request("POST", self._base_url, data=data)
+                self._primp_request_count += 1
                 return resp.status_code, resp.text
 
             return await asyncio.to_thread(_sync_request)
@@ -272,21 +349,26 @@ class DuckDuckGoSearcher:
                 f"(SafeSearch: {self.safe_search.name}, Region: {region or 'default'}, Page: {page})"
             )
 
-            headers = self._build_headers()
+            headers = self._build_headers(region)
 
-            # Retry loop for 202 (CAPTCHA) and 429 (rate limit)
+            # Retry loop: rotate proxy on errors, CAPTCHA, blocks, or empty results
             for attempt in range(self._max_retries + 1):
                 status_code, response_text = await self._do_request(data, headers)
 
                 if status_code == 200:
                     soup = BeautifulSoup(response_text, "html.parser")
                     if not soup:
+                        if self._rotator and attempt < self._max_retries:
+                            self._reset_primp_session()
+                            await ctx.info(f"Empty parse, rotating proxy (attempt {attempt + 1}/{self._max_retries})")
+                            continue
                         return [], False, None
 
                     # Check for CAPTCHA page at HTTP 200
                     if self._is_captcha_page(soup):
                         if self._rotator and self._current_proxy:
                             self._rotator.mark_blocked(self._current_proxy)
+                            self._reset_primp_session()
                             await ctx.info(f"CAPTCHA detected, proxy blocked, rotating (attempt {attempt + 1}/{self._max_retries})")
                             continue
                         if attempt < self._max_retries:
@@ -320,6 +402,10 @@ class DuckDuckGoSearcher:
                         )
 
                     if not results:
+                        if self._rotator and attempt < self._max_retries:
+                            self._reset_primp_session()
+                            await ctx.info(f"Empty results, rotating proxy (attempt {attempt + 1}/{self._max_retries})")
+                            continue
                         page_text = soup.get_text(separator="\n", strip=True)[:2000]
                         return [], has_next_page, page_text if page_text else None
 
@@ -328,6 +414,7 @@ class DuckDuckGoSearcher:
                 elif status_code in (202, 429):
                     if self._rotator and self._current_proxy:
                         self._rotator.mark_blocked(self._current_proxy)
+                        self._reset_primp_session()
                         await ctx.info(f"HTTP {status_code}, proxy blocked, rotating (attempt {attempt + 1}/{self._max_retries})")
                         continue
                     if attempt < self._max_retries:
@@ -338,10 +425,18 @@ class DuckDuckGoSearcher:
                         continue
                     return [], False, response_text[:2000] if response_text else f"HTTP {status_code}"
 
-                elif status_code >= 400:
-                    if self._rotator and self._current_proxy and status_code == 403:
+                elif status_code == 403:
+                    if self._rotator and self._current_proxy:
                         self._rotator.mark_blocked(self._current_proxy)
+                        self._reset_primp_session()
                         await ctx.info(f"HTTP 403, proxy blocked, rotating (attempt {attempt + 1}/{self._max_retries})")
+                        continue
+                    return [], False, response_text[:2000] if response_text else f"HTTP 403"
+
+                elif status_code >= 400:
+                    if self._rotator and attempt < self._max_retries:
+                        self._reset_primp_session()
+                        await ctx.info(f"HTTP {status_code}, rotating proxy (attempt {attempt + 1}/{self._max_retries})")
                         continue
                     return [], False, response_text[:2000] if response_text else f"HTTP {status_code}"
 
@@ -351,6 +446,7 @@ class DuckDuckGoSearcher:
             # Connection errors with proxy pool: mark proxy and retry
             if self._rotator and self._current_proxy:
                 self._rotator.mark_blocked(self._current_proxy)
+                self._reset_primp_session()
                 for retry in range(self._max_retries):
                     await ctx.info(f"Connection error: {e}, rotating proxy (retry {retry + 1}/{self._max_retries})")
                     try:
@@ -377,13 +473,16 @@ class DuckDuckGoSearcher:
                                 return [], has_next_page, page_text if page_text else None
                         elif status_code in (202, 429) and self._current_proxy:
                             self._rotator.mark_blocked(self._current_proxy)
+                            self._reset_primp_session()
                             continue
                         elif status_code == 403 and self._current_proxy:
                             self._rotator.mark_blocked(self._current_proxy)
+                            self._reset_primp_session()
                             continue
                     except Exception:
                         if self._current_proxy:
                             self._rotator.mark_blocked(self._current_proxy)
+                        self._reset_primp_session()
                         continue
             traceback.print_exc(file=sys.stderr)
             return [], False, str(e)
@@ -589,6 +688,9 @@ class WebContentFetcher:
 # Initialize FastMCP server
 mcp = FastMCP("ddg-search")
 
+# Load .env before reading configuration
+_load_dotenv()
+
 # Read configuration from environment variables
 SAFE_SEARCH_MODE = os.getenv("DDG_SAFE_SEARCH", "MODERATE").upper()
 REGION_CODE = os.getenv("DDG_REGION", "")
@@ -654,6 +756,7 @@ async def fetch_content(
 
 def main():
     global fetcher
+    _load_dotenv()
     parser = argparse.ArgumentParser(description="DuckDuckGo MCP Server")
     parser.add_argument(
         "--transport",
