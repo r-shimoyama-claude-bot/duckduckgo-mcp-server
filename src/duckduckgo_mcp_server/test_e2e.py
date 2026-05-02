@@ -105,7 +105,8 @@ async def test_search_tool_e2e(ddg_html_factory):
     mock_client.post = AsyncMock(return_value=mock_resp)
     mock_client.is_closed = False
 
-    with patch.object(searcher_module.searcher, "_get_client", return_value=mock_client):
+    with patch.object(searcher_module.searcher, "_get_client", return_value=mock_client), \
+         patch.object(searcher_module.searcher, "_primp_available", False):
         async with create_connected_server_and_client_session(mcp_app) as client:
             result = await client.call_tool("search", {"query": "e2e test"})
             text = result.content[0].text
@@ -141,9 +142,10 @@ async def test_search_tool_handles_errors():
     mock_client.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
     mock_client.is_closed = False
 
-    with patch.object(searcher_module.searcher, "_get_client", return_value=mock_client):
+    with patch.object(searcher_module.searcher, "_get_client", return_value=mock_client), \
+         patch.object(searcher_module.searcher, "_primp_available", False):
         async with create_connected_server_and_client_session(mcp_app) as client:
             result = await client.call_tool("search", {"query": "timeout test"})
             text = result.content[0].text
             # Should return a user-friendly message, not a protocol error
-            assert "No results were found" in text or "error" in text.lower()
+            assert "timeout" in text.lower()

@@ -11,7 +11,6 @@ import httpx
 import duckduckgo_mcp_server.server
 
 from duckduckgo_mcp_server.server import (
-    RateLimiter,
     DuckDuckGoSearcher,
     SafeSearchMode,
     SearchResult,
@@ -34,51 +33,16 @@ class DummyCtx:
         return None
 
 
-class TestRateLimiter(unittest.TestCase):
-    def test_acquire_removes_expired_entries(self):
-        limiter = RateLimiter(requests_per_minute=1)
-        limiter.requests.append(datetime.now() - timedelta(minutes=2))
-
-        asyncio.run(limiter.acquire())
-
-        self.assertEqual(len(limiter.requests), 1)
-        self.assertLess((datetime.now() - limiter.requests[0]).total_seconds(), 1.0)
-
-
-class TestRateLimiterEdgeCases(unittest.TestCase):
-    def test_acquire_blocks_when_at_capacity(self):
-        limiter = RateLimiter(requests_per_minute=2)
-        now = datetime.now()
-        limiter.requests = [now - timedelta(seconds=10), now - timedelta(seconds=5)]
-
-        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            asyncio.run(limiter.acquire())
-            # Called twice: once for rate limit wait, once for jitter
-            self.assertEqual(mock_sleep.call_count, 2)
-            # First call should wait roughly 50 seconds (60 - 10)
-            wait_time = mock_sleep.call_args_list[0][0][0]
-            self.assertGreater(wait_time, 40)
-            self.assertLessEqual(wait_time, 60)
-
-    def test_acquire_allows_after_window_expires(self):
-        limiter = RateLimiter(requests_per_minute=2)
-        limiter.requests = [
-            datetime.now() - timedelta(seconds=61),
-            datetime.now() - timedelta(seconds=61),
-        ]
-
-        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            asyncio.run(limiter.acquire())
-            # Only jitter sleep, no rate limit wait
-            mock_sleep.assert_called_once()
-            jitter_time = mock_sleep.call_args[0][0]
-            self.assertGreaterEqual(jitter_time, 0.1)
-            self.assertLessEqual(jitter_time, 0.5)
+def _make_searcher(**kwargs):
+    """Create a DuckDuckGoSearcher with primp disabled so tests use httpx mocks."""
+    s = DuckDuckGoSearcher(**kwargs)
+    s._primp_available = False
+    return s
 
 
 class TestDuckDuckGoSearcher(unittest.TestCase):
     def test_format_results_for_llm_populates_entries(self):
-        searcher = DuckDuckGoSearcher()
+        searcher = _make_searcher()
         results = [
             SearchResult(
                 title="First Result",
@@ -101,11 +65,68 @@ class TestDuckDuckGoSearcher(unittest.TestCase):
         self.assertIn("URL: https://example.com/first", formatted)
 
     def test_format_results_for_llm_handles_empty(self):
-        searcher = DuckDuckGoSearcher()
+        searcher = _make_searcher()
 
         formatted = searcher.format_results_for_llm([])
 
         self.assertIn("No results were found", formatted)
+
+
+class TestSearchThrottle(unittest.TestCase):
+    def test_throttle_waits_when_request_too_recent(self):
+        """If last request was <2s ago, the next request should sleep."""
+        searcher = _make_searcher()
+        searcher._last_request_time = datetime.now() - timedelta(seconds=0.5)
+        ctx = DummyCtx()
+
+        mock_resp = _mock_post_response("<html><body></body></html>")
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.is_closed = False
+
+        with patch.object(searcher, "_get_client", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            asyncio.run(searcher.search("test", ctx))
+
+        # Should have slept for roughly 1.5 seconds (2.0 - 0.5)
+        mock_sleep.assert_called_once()
+        wait_time = mock_sleep.call_args[0][0]
+        self.assertGreater(wait_time, 1.0)
+        self.assertLessEqual(wait_time, 2.0)
+
+    def test_throttle_skips_wait_when_enough_time_passed(self):
+        """If last request was >=2s ago, no sleep needed."""
+        searcher = _make_searcher()
+        searcher._last_request_time = datetime.now() - timedelta(seconds=3)
+        ctx = DummyCtx()
+
+        mock_resp = _mock_post_response("<html><body></body></html>")
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.is_closed = False
+
+        with patch.object(searcher, "_get_client", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            asyncio.run(searcher.search("test", ctx))
+
+        mock_sleep.assert_not_called()
+
+    def test_throttle_not_active_on_first_request(self):
+        """First request ever should not sleep."""
+        searcher = _make_searcher()
+        self.assertIsNone(searcher._last_request_time)
+        ctx = DummyCtx()
+
+        mock_resp = _mock_post_response("<html><body></body></html>")
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.is_closed = False
+
+        with patch.object(searcher, "_get_client", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            asyncio.run(searcher.search("test", ctx))
+
+        mock_sleep.assert_not_called()
 
 
 def _make_ddg_html(results):
@@ -135,7 +156,7 @@ def _mock_post_response(html, status_code=200):
 class TestDuckDuckGoSearcherParsing(unittest.TestCase):
     def _run_search(self, html, region="", page=1):
         """Helper to run a search with mocked HTTP."""
-        searcher = DuckDuckGoSearcher()
+        searcher = _make_searcher()
         ctx = DummyCtx()
 
         mock_resp = _mock_post_response(html)
@@ -145,8 +166,8 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
 
         with patch.object(searcher, "_get_client", return_value=mock_client), \
              patch("asyncio.sleep", new_callable=AsyncMock):
-            results, has_next_page, blocked = asyncio.run(searcher.search("test query", ctx, region, page))
-        return results, has_next_page, blocked
+            results, has_next_page, raw_response = asyncio.run(searcher.search("test query", ctx, region, page))
+        return results, has_next_page, raw_response
 
     def test_search_parses_results_from_html(self):
         html = _make_ddg_html([
@@ -179,7 +200,7 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
         self.assertEqual(results[0].snippet, "")
 
     def test_search_returns_empty_on_timeout(self):
-        searcher = DuckDuckGoSearcher()
+        searcher = _make_searcher()
         ctx = DummyCtx()
 
         mock_client = AsyncMock()
@@ -187,18 +208,19 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
         mock_client.is_closed = False
 
         with patch.object(searcher, "_get_client", return_value=mock_client):
-            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
+            results, has_next, raw_response = asyncio.run(searcher.search("test", ctx))
         self.assertEqual(results, [])
         self.assertFalse(has_next)
-        self.assertFalse(blocked)
+        self.assertEqual(raw_response, "timeout")
 
     def test_search_returns_empty_on_http_error(self):
-        searcher = DuckDuckGoSearcher()
+        searcher = _make_searcher()
         ctx = DummyCtx()
 
         mock_resp = MagicMock()
         mock_resp.status_code = 503
         mock_resp.request = MagicMock()
+        mock_resp.text = "Service Unavailable"
         error = httpx.HTTPStatusError("error", request=mock_resp.request, response=mock_resp)
 
         mock_client = AsyncMock()
@@ -207,19 +229,20 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
         mock_client.is_closed = False
 
         with patch.object(searcher, "_get_client", return_value=mock_client):
-            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
+            results, has_next, raw_response = asyncio.run(searcher.search("test", ctx))
         self.assertEqual(results, [])
         self.assertFalse(has_next)
-        self.assertFalse(blocked)
+        self.assertEqual(raw_response, "Service Unavailable")
 
     def test_search_returns_empty_on_no_results(self):
         html = "<html><body><p>No results</p></body></html>"
-        results, _, _ = self._run_search(html)
+        results, _, raw_response = self._run_search(html)
         self.assertEqual(results, [])
+        self.assertIn("No results", raw_response)
 
-    def test_search_detects_captcha_response(self):
+    def test_search_passes_through_captcha_page(self):
         html = "<html><body><div class='anomaly-modal'>Are you a bot?</div></body></html>"
-        searcher = DuckDuckGoSearcher()
+        searcher = _make_searcher()
         ctx = DummyCtx()
 
         mock_resp = MagicMock()
@@ -233,15 +256,14 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
 
         with patch.object(searcher, "_get_client", return_value=mock_client), \
              patch("asyncio.sleep", new_callable=AsyncMock):
-            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
+            results, has_next, raw_response = asyncio.run(searcher.search("test", ctx))
         self.assertEqual(results, [])
         self.assertFalse(has_next)
-        self.assertTrue(blocked)
-        self.assertIsNotNone(searcher._cooldown_until)
+        self.assertIn("Are you a bot?", raw_response)
 
-    def test_search_detects_captcha_text_signal(self):
+    def test_search_passes_through_captcha_text_page(self):
         html = "<html><body><p>Unfortunately, bots use DuckDuckGo too much</p></body></html>"
-        searcher = DuckDuckGoSearcher()
+        searcher = _make_searcher()
         ctx = DummyCtx()
 
         mock_resp = MagicMock()
@@ -255,16 +277,17 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
 
         with patch.object(searcher, "_get_client", return_value=mock_client), \
              patch("asyncio.sleep", new_callable=AsyncMock):
-            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
+            results, has_next, raw_response = asyncio.run(searcher.search("test", ctx))
         self.assertEqual(results, [])
-        self.assertTrue(blocked)
+        self.assertIn("bots use DuckDuckGo", raw_response)
 
-    def test_search_detects_http_403(self):
-        searcher = DuckDuckGoSearcher()
+    def test_search_passes_through_http_403(self):
+        searcher = _make_searcher()
         ctx = DummyCtx()
 
         mock_resp = MagicMock()
         mock_resp.status_code = 403
+        mock_resp.text = "Forbidden"
 
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(return_value=mock_resp)
@@ -272,17 +295,17 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
 
         with patch.object(searcher, "_get_client", return_value=mock_client), \
              patch("asyncio.sleep", new_callable=AsyncMock):
-            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
+            results, has_next, raw_response = asyncio.run(searcher.search("test", ctx))
         self.assertEqual(results, [])
-        self.assertTrue(blocked)
-        self.assertIsNotNone(searcher._cooldown_until)
+        self.assertEqual(raw_response, "Forbidden")
 
-    def test_search_detects_http_429(self):
-        searcher = DuckDuckGoSearcher()
+    def test_search_passes_through_http_429(self):
+        searcher = _make_searcher()
         ctx = DummyCtx()
 
         mock_resp = MagicMock()
         mock_resp.status_code = 429
+        mock_resp.text = "Too Many Requests"
 
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(return_value=mock_resp)
@@ -290,20 +313,9 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
 
         with patch.object(searcher, "_get_client", return_value=mock_client), \
              patch("asyncio.sleep", new_callable=AsyncMock):
-            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
+            results, has_next, raw_response = asyncio.run(searcher.search("test", ctx))
         self.assertEqual(results, [])
-        self.assertTrue(blocked)
-
-    def test_search_respects_cooldown(self):
-        searcher = DuckDuckGoSearcher()
-        searcher._cooldown_until = datetime.now() + timedelta(seconds=60)
-        ctx = DummyCtx()
-
-        with patch("asyncio.sleep", new_callable=AsyncMock):
-            results, has_next, blocked = asyncio.run(searcher.search("test", ctx))
-        self.assertEqual(results, [])
-        self.assertTrue(blocked)
-        # No HTTP request should have been made during cooldown
+        self.assertEqual(raw_response, "Too Many Requests")
 
 
 def _serve_html(html_content):
@@ -650,7 +662,7 @@ class TestConfiguration(unittest.TestCase):
         self.assertEqual(SafeSearchMode.OFF.value, "-2")
 
     def test_searcher_passes_safe_search_to_request(self):
-        searcher = DuckDuckGoSearcher(safe_search=SafeSearchMode.STRICT)
+        searcher = _make_searcher(safe_search=SafeSearchMode.STRICT)
         ctx = DummyCtx()
 
         mock_resp = _mock_post_response("<html><body></body></html>")
@@ -667,7 +679,7 @@ class TestConfiguration(unittest.TestCase):
         self.assertEqual(post_data["kp"], "1")
 
     def test_searcher_passes_region_to_request(self):
-        searcher = DuckDuckGoSearcher(default_region="us-en")
+        searcher = _make_searcher(default_region="us-en")
         ctx = DummyCtx()
 
         mock_resp = _mock_post_response("<html><body></body></html>")
