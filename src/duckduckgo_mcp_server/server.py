@@ -31,6 +31,68 @@ class SearchResult:
     position: int
 
 
+class ProxyRotator:
+    """Round-robin proxy pool with block tracking and dynamic throttle."""
+
+    def __init__(self, proxies: List[str], target_interval: float = 5.0, cooldown: float = 300.0):
+        self._proxies = proxies
+        self._target_interval = target_interval
+        self._cooldown = cooldown
+        self._index = 0
+        self._blocked: Dict[str, datetime] = {}
+
+    @staticmethod
+    def from_env() -> Optional["ProxyRotator"]:
+        raw = os.getenv("DDG_PROXIES", "")
+        if not raw:
+            return None
+        proxies = []
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split(":")
+            if len(parts) == 4:
+                ip, port, user, pwd = parts
+                proxies.append(f"http://{user}:{pwd}@{ip}:{port}")
+            else:
+                proxies.append(entry)
+        if not proxies:
+            return None
+        target = float(os.getenv("DDG_PROXIES_TARGET_INTERVAL", "5.0"))
+        cooldown = float(os.getenv("DDG_PROXIES_COOLDOWN", "300.0"))
+        return ProxyRotator(proxies, target_interval=target, cooldown=cooldown)
+
+    def next(self) -> Optional[str]:
+        now = datetime.now()
+        # Auto-revive expired blocks
+        expired = [p for p, t in self._blocked.items() if now >= t]
+        for p in expired:
+            del self._blocked[p]
+        # Find next available proxy
+        for _ in range(len(self._proxies)):
+            proxy = self._proxies[self._index % len(self._proxies)]
+            self._index += 1
+            if proxy not in self._blocked:
+                return proxy
+        return None
+
+    def mark_blocked(self, proxy: str):
+        self._blocked[proxy] = datetime.now() + timedelta(seconds=self._cooldown)
+
+    @property
+    def active_count(self) -> int:
+        now = datetime.now()
+        return sum(1 for p in self._proxies if p not in self._blocked or now >= self._blocked[p])
+
+    @property
+    def throttle_interval(self) -> float:
+        count = self.active_count
+        if count <= 0:
+            return self._target_interval
+        return self._target_interval / count
+
+
 class DuckDuckGoSearcher:
     DEFAULT_BASE_URL = "https://lite.duckduckgo.com/lite/"
     RESULTS_PER_PAGE = 10
@@ -69,6 +131,8 @@ class DuckDuckGoSearcher:
         self._max_retries = int(os.getenv("DDG_MAX_RETRIES", "3"))
         self._proxy = os.getenv("DDG_PROXY", "")
         self._base_url = os.getenv("DDG_BASE_URL", self.DEFAULT_BASE_URL)
+        self._rotator = ProxyRotator.from_env()
+        self._current_proxy: Optional[str] = None
         try:
             import primp  # noqa: F401
             self._primp_available = True
@@ -142,9 +206,10 @@ class DuckDuckGoSearcher:
         return await self._fetch_results(query, ctx, effective_region, page)
 
     async def _throttle(self):
+        interval = self._rotator.throttle_interval if self._rotator else self._throttle_interval
         if self._last_request_time:
             elapsed = (datetime.now() - self._last_request_time).total_seconds()
-            wait = max(0.0, self._throttle_interval - elapsed)
+            wait = max(0.0, interval - elapsed)
             if self._throttle_jitter > 0 and wait > 0:
                 wait = max(0.0, wait + random.uniform(-wait * self._throttle_jitter, wait * self._throttle_jitter))
             if wait > 0:
@@ -152,16 +217,22 @@ class DuckDuckGoSearcher:
         self._last_request_time = datetime.now()
 
     async def _do_request(self, data: Dict[str, str], headers: Dict[str, str]) -> tuple[int, str]:
+        # Determine proxy for this request
+        proxy = None
+        if self._rotator:
+            proxy = self._rotator.next()
+        elif self._proxy:
+            proxy = self._proxy
+        self._current_proxy = proxy
+
         if self._primp_available:
             import primp
 
             def _sync_request():
                 kwargs = {"impersonate": "random", "impersonate_os": "random", "timeout": 30}
-                if self._proxy:
-                    kwargs["proxy"] = self._proxy
+                if proxy:
+                    kwargs["proxy"] = proxy
                 client = primp.Client(**kwargs)
-                # Only pass non-User-Agent headers so primp's impersonated
-                # User-Agent stays consistent with the TLS fingerprint.
                 safe_headers = {k: v for k, v in headers.items() if k.lower() != "user-agent"}
                 if safe_headers:
                     client.headers_update(safe_headers)
@@ -214,6 +285,10 @@ class DuckDuckGoSearcher:
 
                     # Check for CAPTCHA page at HTTP 200
                     if self._is_captcha_page(soup):
+                        if self._rotator and self._current_proxy:
+                            self._rotator.mark_blocked(self._current_proxy)
+                            await ctx.info(f"CAPTCHA detected, proxy blocked, rotating (attempt {attempt + 1}/{self._max_retries})")
+                            continue
                         if attempt < self._max_retries:
                             delay = self._retry_base_delay * (2 ** attempt)
                             await ctx.info(f"CAPTCHA detected, retrying in {delay:.1f}s (attempt {attempt + 1}/{self._max_retries})")
@@ -251,6 +326,10 @@ class DuckDuckGoSearcher:
                     return results, has_next_page, None
 
                 elif status_code in (202, 429):
+                    if self._rotator and self._current_proxy:
+                        self._rotator.mark_blocked(self._current_proxy)
+                        await ctx.info(f"HTTP {status_code}, proxy blocked, rotating (attempt {attempt + 1}/{self._max_retries})")
+                        continue
                     if attempt < self._max_retries:
                         delay = self._retry_base_delay * (2 ** attempt)
                         await ctx.info(f"HTTP {status_code}, retrying in {delay:.1f}s (attempt {attempt + 1}/{self._max_retries})")
@@ -260,15 +339,52 @@ class DuckDuckGoSearcher:
                     return [], False, response_text[:2000] if response_text else f"HTTP {status_code}"
 
                 elif status_code >= 400:
+                    if self._rotator and self._current_proxy and status_code == 403:
+                        self._rotator.mark_blocked(self._current_proxy)
+                        await ctx.info(f"HTTP 403, proxy blocked, rotating (attempt {attempt + 1}/{self._max_retries})")
+                        continue
                     return [], False, response_text[:2000] if response_text else f"HTTP {status_code}"
 
             return [], False, response_text[:2000] if response_text else "Max retries exceeded"
 
-        except httpx.TimeoutException as e:
-            return [], False, str(e)
-        except httpx.HTTPError as e:
-            return [], False, str(e)
         except Exception as e:
+            # Connection errors with proxy pool: mark proxy and retry
+            if self._rotator and self._current_proxy:
+                self._rotator.mark_blocked(self._current_proxy)
+                for retry in range(self._max_retries):
+                    await ctx.info(f"Connection error: {e}, rotating proxy (retry {retry + 1}/{self._max_retries})")
+                    try:
+                        status_code, response_text = await self._do_request(data, headers)
+                        if status_code == 200:
+                            soup = BeautifulSoup(response_text, "html.parser")
+                            if soup and not self._is_captcha_page(soup):
+                                vqd, has_next_page = self._parse_pagination(soup)
+                                if vqd:
+                                    self._vqd_cache[cache_key] = vqd
+                                results = []
+                                links = soup.find_all("a", class_="result-link")
+                                snippets = soup.find_all("td", class_="result-snippet")
+                                for i, link in enumerate(links):
+                                    results.append(SearchResult(
+                                        title=link.get_text(strip=True),
+                                        link=link.get("href", ""),
+                                        snippet=snippets[i].get_text(strip=True) if i < len(snippets) else "",
+                                        position=len(results) + 1,
+                                    ))
+                                if results:
+                                    return results, has_next_page, None
+                                page_text = soup.get_text(separator="\n", strip=True)[:2000]
+                                return [], has_next_page, page_text if page_text else None
+                        elif status_code in (202, 429) and self._current_proxy:
+                            self._rotator.mark_blocked(self._current_proxy)
+                            continue
+                        elif status_code == 403 and self._current_proxy:
+                            self._rotator.mark_blocked(self._current_proxy)
+                            continue
+                    except Exception:
+                        if self._current_proxy:
+                            self._rotator.mark_blocked(self._current_proxy)
+                        continue
             traceback.print_exc(file=sys.stderr)
             return [], False, str(e)
 

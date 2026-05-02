@@ -55,6 +55,9 @@ Environment variables read at startup (not per-request):
 - `DDG_MAX_RETRIES`: Max retries on CAPTCHA/rate-limit (default `3`)
 - `DDG_PROXY`: SOCKS5 proxy for primp, e.g. `socks5h://127.0.0.1:9050` (Tor)
 - `DDG_BASE_URL`: Override the DDG Lite endpoint URL, e.g. `https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/lite/` (DDG official Onion address for Tor)
+- `DDG_PROXIES`: Comma-separated residential proxy pool in `ip:port:user:pass` format. Enables round-robin IP rotation with automatic block detection and dynamic throttling (~5s/search overall). Blocked IPs are temporarily excluded and revived after cooldown.
+- `DDG_PROXIES_TARGET_INTERVAL`: Target seconds between searches across all proxies (default `5.0`). Throttle per-proxy is auto-calculated as `target / active_count`.
+- `DDG_PROXIES_COOLDOWN`: Seconds to block a proxy after CAPTCHA/403 detection (default `300.0`)
 
 ## Testing
 

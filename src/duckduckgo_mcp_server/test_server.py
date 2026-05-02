@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import threading
 from datetime import datetime, timedelta
@@ -12,6 +13,7 @@ import duckduckgo_mcp_server.server
 
 from duckduckgo_mcp_server.server import (
     DuckDuckGoSearcher,
+    ProxyRotator,
     SafeSearchMode,
     SearchResult,
     SUPPORTED_FETCH_BACKENDS,
@@ -694,3 +696,70 @@ class TestConfiguration(unittest.TestCase):
         call_kwargs = mock_client.post.call_args
         post_data = call_kwargs.kwargs.get("data") or call_kwargs[1].get("data")
         self.assertEqual(post_data["kl"], "us-en")
+
+
+class TestProxyRotator(unittest.TestCase):
+    def test_round_robin(self):
+        proxies = ["http://a:1", "http://b:2", "http://c:3"]
+        rotator = ProxyRotator(proxies, target_interval=5.0)
+        self.assertEqual(rotator.next(), "http://a:1")
+        self.assertEqual(rotator.next(), "http://b:2")
+        self.assertEqual(rotator.next(), "http://c:3")
+        self.assertEqual(rotator.next(), "http://a:1")
+
+    def test_blocked_proxy_skipped(self):
+        proxies = ["http://a:1", "http://b:2", "http://c:3"]
+        rotator = ProxyRotator(proxies, target_interval=5.0, cooldown=300.0)
+        rotator.next()  # a
+        p = rotator.next()  # b
+        rotator.mark_blocked(p)
+        # Should skip b and go to c then a
+        self.assertEqual(rotator.next(), "http://c:3")
+        self.assertEqual(rotator.next(), "http://a:1")
+
+    def test_all_blocked_returns_none(self):
+        proxies = ["http://a:1"]
+        rotator = ProxyRotator(proxies, target_interval=5.0, cooldown=300.0)
+        p = rotator.next()
+        rotator.mark_blocked(p)
+        self.assertIsNone(rotator.next())
+
+    def test_expired_block_revived(self):
+        proxies = ["http://a:1", "http://b:2"]
+        rotator = ProxyRotator(proxies, target_interval=5.0, cooldown=0.0)
+        p = rotator.next()  # a
+        rotator.mark_blocked(p)
+        # Cooldown is 0 so a is revived; round-robin advances to b, then a
+        self.assertEqual(rotator.next(), "http://b:2")
+        self.assertEqual(rotator.next(), "http://a:1")
+
+    def test_throttle_interval_scales_with_active_count(self):
+        proxies = ["http://a:1", "http://b:2", "http://c:3", "http://d:4"]
+        rotator = ProxyRotator(proxies, target_interval=5.0)
+        # 4 active: 5/4 = 1.25
+        self.assertAlmostEqual(rotator.throttle_interval, 1.25)
+        # Block 2
+        rotator.mark_blocked("http://a:1")
+        rotator.mark_blocked("http://b:2")
+        # 2 active: 5/2 = 2.5
+        self.assertAlmostEqual(rotator.throttle_interval, 2.5)
+
+    def test_active_count(self):
+        proxies = ["http://a:1", "http://b:2", "http://c:3"]
+        rotator = ProxyRotator(proxies, target_interval=5.0, cooldown=300.0)
+        self.assertEqual(rotator.active_count, 3)
+        rotator.mark_blocked("http://a:1")
+        self.assertEqual(rotator.active_count, 2)
+
+    def test_from_env_parses_ip_port_user_pass(self):
+        with patch.dict(os.environ, {"DDG_PROXIES": "1.2.3.4:8080:user:pass,5.6.7.8:9090:u2:p2"}):
+            rotator = ProxyRotator.from_env()
+            self.assertIsNotNone(rotator)
+            self.assertEqual(len(rotator._proxies), 2)
+            self.assertEqual(rotator._proxies[0], "http://user:pass@1.2.3.4:8080")
+            self.assertEqual(rotator._proxies[1], "http://u2:p2@5.6.7.8:9090")
+
+    def test_from_env_returns_none_when_empty(self):
+        with patch.dict(os.environ, {"DDG_PROXIES": ""}):
+            self.assertIsNone(ProxyRotator.from_env())
+
