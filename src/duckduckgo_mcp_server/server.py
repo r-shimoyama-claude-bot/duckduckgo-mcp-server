@@ -529,7 +529,7 @@ class WebContentFetcher:
             )
         self.default_backend = backend
         self._last_request_time: Dict[str, datetime] = {}
-        self._throttle_interval = float(os.getenv("DDG_FETCH_THROTTLE", "1.0"))
+        self._throttle_interval = float(os.getenv("DDG_FETCH_THROTTLE", "2.0"))
 
     async def _throttle_domain(self, domain: str):
         last = self._last_request_time.get(domain)

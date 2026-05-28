@@ -58,6 +58,7 @@ Environment variables read at startup (not per-request):
 - `DDG_PROXIES`: Comma-separated residential proxy pool in `ip:port:user:pass` format. Enables round-robin IP rotation with automatic block detection and dynamic throttling (~5s/search overall). Blocked IPs are temporarily excluded and revived after cooldown.
 - `DDG_PROXIES_TARGET_INTERVAL`: Target seconds between searches across all proxies (default `5.0`). Throttle per-proxy is auto-calculated as `target / active_count`.
 - `DDG_PROXIES_COOLDOWN`: Seconds to block a proxy after CAPTCHA/403 detection (default `300.0`)
+- `DDG_FETCH_THROTTLE`: Min seconds between fetch_content requests per domain (default `2.0`)
 
 ## Testing
 
