@@ -16,6 +16,7 @@ htmlcov/
 
 # Environments
 .env
+.env.bak
 .venv
 env/
 venv/
@@ -39,3 +40,6 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Tool-generated
+.smart_version
