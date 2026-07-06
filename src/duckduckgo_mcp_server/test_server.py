@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import unittest
 
 import httpx
+from bs4 import BeautifulSoup
 
 import duckduckgo_mcp_server.server
 
@@ -36,10 +37,16 @@ class DummyCtx:
 
 
 def _make_searcher(**kwargs):
-    """Create a DuckDuckGoSearcher with primp disabled so tests use httpx mocks."""
+    """Create a DuckDuckGoSearcher with primp disabled so tests use httpx mocks.
+
+    Tests assume the clearnet lite markup (result-link); force the lite parser
+    regardless of any DDG_BASE_URL set in .env (which may be the Onion html route).
+    """
     s = DuckDuckGoSearcher(**kwargs)
     s._primp_available = False
     s._rotator = None
+    s._is_onion = False
+    s._is_html_endpoint = False
     return s
 
 
@@ -829,6 +836,7 @@ class TestPrimpSessionManagement(unittest.TestCase):
         """_get_primp_client should build a new client if none exists."""
         searcher = DuckDuckGoSearcher()
         searcher._primp_available = True
+        searcher._warmup_enabled = False
         searcher._primp_client = None
         client = searcher._get_primp_client()
         self.assertIsNotNone(client)
@@ -837,6 +845,7 @@ class TestPrimpSessionManagement(unittest.TestCase):
         """After session_rotation_interval requests, client should be rebuilt."""
         searcher = DuckDuckGoSearcher()
         searcher._primp_available = True
+        searcher._warmup_enabled = False
         searcher._session_rotation_interval = 2
         first = searcher._get_primp_client()
         searcher._primp_request_count = 2
@@ -847,6 +856,7 @@ class TestPrimpSessionManagement(unittest.TestCase):
         """Client should be rebuilt when proxy changes, even if session is fresh."""
         searcher = DuckDuckGoSearcher()
         searcher._primp_available = True
+        searcher._warmup_enabled = False
         first = searcher._get_primp_client("http://a:1")
         # Same proxy → reused
         reused = searcher._get_primp_client("http://a:1")
@@ -854,4 +864,345 @@ class TestPrimpSessionManagement(unittest.TestCase):
         # Different proxy → rebuilt
         second = searcher._get_primp_client("http://b:2")
         self.assertIsNot(first, second)
+
+
+class TestWarmup(unittest.TestCase):
+    """Session warm-up (GET before POST) behavior."""
+
+    def _searcher_with_mock_client(self):
+        s = DuckDuckGoSearcher()
+        s._primp_available = True
+        s._warmup_enabled = True
+        mock_client = MagicMock()
+        s._build_primp_client = MagicMock(return_value=mock_client)
+        return s, mock_client
+
+    def test_warmup_get_called_on_new_client(self):
+        """A freshly built client triggers one warm-up GET to the endpoint."""
+        searcher, mock_client = self._searcher_with_mock_client()
+        searcher._get_primp_client()
+        gets = [c for c in mock_client.request.call_args_list
+                if c.args and c.args[0] == "GET"]
+        self.assertEqual(len(gets), 1)
+        self.assertEqual(gets[0].args[1], searcher._base_url)
+
+    def test_warmup_skipped_when_disabled(self):
+        """No GET is issued when warm-up is disabled."""
+        searcher, mock_client = self._searcher_with_mock_client()
+        searcher._warmup_enabled = False
+        searcher._get_primp_client()
+        mock_client.request.assert_not_called()
+
+    def test_warmup_called_once_per_proxy(self):
+        """Reusing the same proxy/client does not warm up again."""
+        searcher, mock_client = self._searcher_with_mock_client()
+        searcher._get_primp_client("http://a:1")
+        searcher._get_primp_client("http://a:1")  # reuse, no rebuild
+        gets = [c for c in mock_client.request.call_args_list
+                if c.args and c.args[0] == "GET"]
+        self.assertEqual(len(gets), 1)
+
+    def test_warmup_failure_does_not_raise(self):
+        """Warm-up errors are swallowed; client is still returned."""
+        searcher, mock_client = self._searcher_with_mock_client()
+        mock_client.request.side_effect = RuntimeError("timeout")
+        client = searcher._get_primp_client()
+        self.assertIsNotNone(client)
+
+    def test_reset_primp_session_re_enables_warmup(self):
+        """After resetting the session, the next build warms up again."""
+        searcher, mock_client = self._searcher_with_mock_client()
+        searcher._get_primp_client("http://a:1")
+        self.assertEqual(mock_client.request.call_count, 1)
+        searcher._reset_primp_session()
+        mock_client2 = MagicMock()
+        searcher._build_primp_client.return_value = mock_client2
+        searcher._get_primp_client("http://a:1")
+        gets = [c for c in mock_client2.request.call_args_list
+                if c.args and c.args[0] == "GET"]
+        self.assertEqual(len(gets), 1)
+
+    def test_direct_ip_uses_direct_key(self):
+        """No-proxy (direct IP) warm-up is tracked under the __direct__ key."""
+        searcher, _ = self._searcher_with_mock_client()
+        searcher._get_primp_client()
+        self.assertIn("__direct__", searcher._warmed_proxies)
+
+
+class TestHtmlEndpointParsing(unittest.TestCase):
+    """Parser for the /html/ endpoint (Onion and clearnet html)."""
+
+    HTML = """
+    <html><body>
+      <div class="results">
+        <div class="result results_links results_links_deep web-result">
+          <h2 class="result__title"><a class="result__a" href="https://example.com/1">Title One</a></h2>
+          <a class="result__snippet">Snippet one</a>
+        </div>
+        <div class="result result--ad results_links">
+          <h2 class="result__title"><a class="result__a" href="https://ad.example.com">Ad Title</a></h2>
+          <a class="result__snippet">Ad snippet</a>
+        </div>
+        <div class="result results_links">
+          <h2 class="result__title"><a class="result__a" href="https://example.com/2">Title Two</a></h2>
+          <a class="result__snippet">Snippet two</a>
+        </div>
+      </div>
+      <form action="/html/">
+        <input name="q" value="t">
+        <input name="vqd" value="4-1234567890">
+        <input name="s" value="20">
+      </form>
+    </body></html>
+    """
+
+    def setUp(self):
+        self.s = _make_searcher()
+        self.s._is_html_endpoint = True
+        self.soup = BeautifulSoup(self.HTML, "html.parser")
+
+    def test_extracts_results_skipping_ads(self):
+        out = self.s._extract_html_endpoint(self.soup)
+        self.assertEqual(len(out), 2)  # sponsored block excluded
+        self.assertEqual(out[0], ("Title One", "https://example.com/1", "Snippet one"))
+        self.assertEqual(out[1][0], "Title Two")
+        self.assertEqual(out[1][1], "https://example.com/2")
+
+    def test_extract_results_builds_searchresult_with_position(self):
+        results = self.s._extract_results(self.soup)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].position, 1)
+        self.assertEqual(results[1].position, 2)
+        self.assertEqual(results[1].title, "Title Two")
+
+    def test_parse_pagination_returns_html_vqd(self):
+        vqd, has_next = self.s._parse_pagination(self.soup)
+        self.assertEqual(vqd, "4-1234567890")
+        self.assertTrue(has_next)
+
+    def test_decode_ddg_redirect(self):
+        decode = DuckDuckGoSearcher._decode_ddg_redirect
+        self.assertEqual(
+            decode("/l/?uddg=https%3A%2F%2Fexample.com%2Fpath&rut=abc"),
+            "https://example.com/path",
+        )
+        self.assertEqual(decode("https://example.com/direct"), "https://example.com/direct")
+        self.assertEqual(decode(""), "")
+
+
+class TestOnionBackendSelection(unittest.TestCase):
+    """Backend selection: Onion → httpx, clearnet → primp."""
+
+    def test_onion_route_uses_httpx_not_primp(self):
+        s = DuckDuckGoSearcher()
+        s._primp_available = True
+        s._is_onion = True
+        s._is_html_endpoint = True
+        self.assertFalse(s._use_primp)
+
+    def test_clearnet_route_uses_primp(self):
+        s = DuckDuckGoSearcher()
+        s._primp_available = True
+        s._is_onion = False
+        s._is_html_endpoint = False
+        self.assertTrue(s._use_primp)
+
+    def test_init_detects_onion_and_html_from_base_url(self):
+        old = os.environ.get("DDG_BASE_URL")
+        os.environ["DDG_BASE_URL"] = "https://abc.onion/html/"
+        try:
+            s = DuckDuckGoSearcher()
+            self.assertTrue(s._is_onion)
+            self.assertTrue(s._is_html_endpoint)
+            self.assertFalse(s._use_primp)
+        finally:
+            if old is None:
+                os.environ.pop("DDG_BASE_URL", None)
+            else:
+                os.environ["DDG_BASE_URL"] = old
+
+
+class TestResultCache(unittest.TestCase):
+    """TTL result cache for repeated searches."""
+
+    def _ctx(self):
+        ctx = MagicMock()
+        ctx.info = AsyncMock()
+        return ctx
+
+    def test_cache_hit_skips_network(self):
+        s = _make_searcher()
+        calls = {"n": 0}
+
+        async def fake_fetch(query, ctx, region, page):
+            calls["n"] += 1
+            return ([SearchResult(title="T", link="https://x/", snippet="s", position=1)], False, None)
+
+        s._fetch_results = fake_fetch
+        ctx = self._ctx()
+
+        async def run():
+            r1 = await s.search("q", ctx)
+            r2 = await s.search("q", ctx)
+            return r1, r2
+
+        r1, r2 = asyncio.run(run())
+        self.assertEqual(calls["n"], 1)  # second call served from cache
+        self.assertEqual(r1, r2)
+
+    def test_empty_results_not_cached(self):
+        s = _make_searcher()
+        calls = {"n": 0}
+
+        async def fake_fetch(query, ctx, region, page):
+            calls["n"] += 1
+            return ([], False, "empty")
+
+        s._fetch_results = fake_fetch
+        ctx = self._ctx()
+
+        async def run():
+            await s.search("q", ctx)
+            await s.search("q", ctx)
+
+        asyncio.run(run())
+        self.assertEqual(calls["n"], 2)  # empty result set not cached
+
+
+class TestSearchBatch(unittest.TestCase):
+    """Parallel batch search tool."""
+
+    def test_batch_combines_per_query_results(self):
+        ctx = MagicMock()
+        ctx.info = AsyncMock()
+
+        async def fake_search(query, c, region="", page=1):
+            return ([SearchResult(title=f"T-{query}", link=f"https://{query}/", snippet="s", position=1)], True, None)
+
+        with patch.object(duckduckgo_mcp_server.server.searcher, "search", side_effect=fake_search):
+            async def run():
+                return await duckduckgo_mcp_server.server.search_batch(["a", "b", "c"], ctx)
+            result = asyncio.run(run())
+        self.assertIn("T-a", result)
+        self.assertIn("T-b", result)
+        self.assertIn("T-c", result)
+        self.assertIn("---", result)
+
+    def test_batch_handles_exception_per_query(self):
+        ctx = MagicMock()
+        ctx.info = AsyncMock()
+
+        async def fake_search(query, c, region="", page=1):
+            if query == "bad":
+                raise RuntimeError("boom")
+            return ([SearchResult(title=f"T-{query}", link=f"https://{query}/", snippet="s", position=1)], True, None)
+
+        with patch.object(duckduckgo_mcp_server.server.searcher, "search", side_effect=fake_search):
+            async def run():
+                return await duckduckgo_mcp_server.server.search_batch(["good", "bad"], ctx)
+            result = asyncio.run(run())
+        self.assertIn("T-good", result)
+        self.assertIn("Error: boom", result)
+
+
+class TestTorPortPool(unittest.TestCase):
+    """Tor multi-port pool: least-inflight selection and client reuse."""
+
+    def test_least_inflight_then_release(self):
+        async def run():
+            from duckduckgo_mcp_server.server import TorPortPool
+            pool = TorPortPool(["127.0.0.1:9050", "127.0.0.1:9051"])
+            p1, _ = await pool.acquire()
+            p2, _ = await pool.acquire()  # other port (less inflight)
+            self.assertNotEqual(p1, p2)
+            pool.release(p1)
+            pool.release(p2)
+            self.assertEqual(pool._inflight[p1], 0)
+            self.assertEqual(pool._inflight[p2], 0)
+            await pool.close_all()
+        asyncio.run(run())
+
+    def test_client_reused_per_port(self):
+        async def run():
+            from duckduckgo_mcp_server.server import TorPortPool
+            pool = TorPortPool(["127.0.0.1:9050"])
+            _, c1 = await pool.acquire()
+            pool.release("127.0.0.1:9050")
+            _, c2 = await pool.acquire()
+            self.assertIs(c1, c2)
+            await pool.close_all()
+        asyncio.run(run())
+
+    def test_close_all_clears_clients(self):
+        async def run():
+            from duckduckgo_mcp_server.server import TorPortPool
+            pool = TorPortPool(["127.0.0.1:9050", "127.0.0.1:9051"])
+            await pool.acquire()
+            await pool.close_all()
+            self.assertEqual(pool._clients, {})
+        asyncio.run(run())
+
+
+class TestMultiProxyInit(unittest.TestCase):
+    """TorPortPool is built only on the Onion route with ports configured."""
+
+    def test_tor_pool_built_on_onion_with_ports(self):
+        old_ports = os.environ.get("DDG_TOR_SOCKS_PORTS")
+        old_base = os.environ.get("DDG_BASE_URL")
+        os.environ["DDG_TOR_SOCKS_PORTS"] = "127.0.0.1:9050,127.0.0.1:9051"
+        os.environ["DDG_BASE_URL"] = "https://abc.onion/html/"
+        try:
+            s = DuckDuckGoSearcher()
+            self.assertIsNotNone(s._tor_pool)
+            self.assertEqual(len(s._tor_pool._ports), 2)
+        finally:
+            if old_ports is None:
+                os.environ.pop("DDG_TOR_SOCKS_PORTS", None)
+            else:
+                os.environ["DDG_TOR_SOCKS_PORTS"] = old_ports
+            if old_base is None:
+                os.environ.pop("DDG_BASE_URL", None)
+            else:
+                os.environ["DDG_BASE_URL"] = old_base
+
+    def test_no_tor_pool_when_unset_or_non_onion(self):
+        s = _make_searcher()  # forces _is_onion=False, lite parser
+        self.assertIsNone(s._tor_pool)
+
+
+class TestSearchBatchConcurrency(unittest.TestCase):
+    """search_batch respects BATCH_MAX and the concurrency semaphore."""
+
+    def test_batch_rejects_too_many_queries(self):
+        ctx = MagicMock()
+        ctx.info = AsyncMock()
+        too_many = [f"q{i}" for i in range(duckduckgo_mcp_server.server.searcher._batch_max + 1)]
+
+        async def run():
+            return await duckduckgo_mcp_server.server.search_batch(too_many, ctx)
+        result = asyncio.run(run())
+        self.assertIn("Too many queries", result)
+
+    def test_batch_caps_concurrency(self):
+        ctx = MagicMock()
+        ctx.info = AsyncMock()
+        state = {"current": 0, "max": 0}
+
+        async def tracking_search(q, c, region="", page=1):
+            state["current"] += 1
+            state["max"] = max(state["max"], state["current"])
+            await asyncio.sleep(0.05)
+            state["current"] -= 1
+            return ([SearchResult(title=q, link="https://x/", snippet="", position=1)], True, None)
+
+        original = duckduckgo_mcp_server.server.searcher._batch_concurrency
+        duckduckgo_mcp_server.server.searcher._batch_concurrency = 3
+        try:
+            with patch.object(duckduckgo_mcp_server.server.searcher, "search", side_effect=tracking_search):
+                async def run():
+                    return await duckduckgo_mcp_server.server.search_batch(["a", "b", "c", "d", "e"], ctx)
+                asyncio.run(run())
+        finally:
+            duckduckgo_mcp_server.server.searcher._batch_concurrency = original
+        self.assertLessEqual(state["max"], 3)
 

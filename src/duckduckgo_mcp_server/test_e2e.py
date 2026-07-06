@@ -106,7 +106,9 @@ async def test_search_tool_e2e(ddg_html_factory):
     mock_client.is_closed = False
 
     with patch.object(searcher_module.searcher, "_get_client", return_value=mock_client), \
-         patch.object(searcher_module.searcher, "_primp_available", False):
+         patch.object(searcher_module.searcher, "_primp_available", False), \
+         patch.object(searcher_module.searcher, "_is_html_endpoint", False), \
+         patch.object(searcher_module.searcher, "_is_onion", False):
         async with create_connected_server_and_client_session(mcp_app) as client:
             result = await client.call_tool("search", {"query": "e2e test"})
             text = result.content[0].text
@@ -143,7 +145,9 @@ async def test_search_tool_handles_errors():
     mock_client.is_closed = False
 
     with patch.object(searcher_module.searcher, "_get_client", return_value=mock_client), \
-         patch.object(searcher_module.searcher, "_primp_available", False):
+         patch.object(searcher_module.searcher, "_primp_available", False), \
+         patch.object(searcher_module.searcher, "_is_html_endpoint", False), \
+         patch.object(searcher_module.searcher, "_is_onion", False):
         async with create_connected_server_and_client_session(mcp_app) as client:
             result = await client.call_tool("search", {"query": "timeout test"})
             text = result.content[0].text
