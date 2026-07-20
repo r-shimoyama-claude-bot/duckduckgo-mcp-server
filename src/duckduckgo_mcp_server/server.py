@@ -1,13 +1,17 @@
 from mcp.server.fastmcp import FastMCP, Context
 import httpx
 from bs4 import BeautifulSoup
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Callable, Tuple
 from dataclasses import dataclass
 import urllib.parse
 import sys
 import traceback
 import asyncio
 import argparse
+import atexit
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta
 import time
@@ -140,6 +144,26 @@ class TorPortPool:
     def release(self, port: str) -> None:
         self._inflight[port] = max(0, self._inflight[port] - 1)
 
+    async def reset_port(self, port: str) -> None:
+        """Close and drop a single port's cached client.
+
+        Tor circuits die (consensus loss, circuit rot) and the cached httpx
+        client keeps reusing the dead circuit's pooled connections — every
+        request then fails with a SOCKS error ("TTL expired") or timeout until
+        the client is rebuilt. Called after a connection error on a port.
+        """
+        client = self._clients.pop(port, None)
+        if client and not client.is_closed:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    async def reset_all(self) -> None:
+        """Rebuild every port's client (e.g. right after a Tor daemon restart)."""
+        for port in list(self._clients):
+            await self.reset_port(port)
+
     async def close_all(self) -> None:
         for client in self._clients.values():
             if client and not client.is_closed:
@@ -165,8 +189,230 @@ def _load_dotenv():
             os.environ[key] = value
 
 
+def _probe_tor_ports(candidates: List[str], timeout: float = 0.2) -> List[str]:
+    """Return candidate SOCKS ports accepting TCP connections (parallel probe).
+
+    Used at startup to auto-detect a local Tor daemon so the CAPTCHA-free
+    Onion route can be selected without explicit DDG_BASE_URL configuration.
+    """
+    import socket
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _open(p: str) -> Optional[str]:
+        host, _, port = p.rpartition(":")
+        try:
+            with socket.create_connection((host or "127.0.0.1", int(port)), timeout=timeout):
+                return p
+        except OSError:
+            return None
+
+    if not candidates:
+        return []
+    with ThreadPoolExecutor(max_workers=min(16, len(candidates))) as ex:
+        return [p for p in ex.map(_open, candidates) if p]
+
+
+class TorDaemonManager:
+    """Owns the optional local Tor daemon lifecycle for the Onion route.
+
+    A pure auto-start helper for non-systemd hosts (WSL2 etc.). When Tor is
+    absent at startup and DDG_AUTO_TOR_START is enabled, it brings the system
+    tor up (service / systemctl / raw tor spawn fallback) and waits for the
+    SOCKS ports to open. Deliberately synchronous — called from
+    DuckDuckGoSearcher.__init__. Runs NO background thread; runtime Tor health
+    stays with the existing circuit breaker + TorPortPool.reset_port.
+
+    Lifecycle:
+      - service/systemctl/command runlevels manage a SHARED tor and are NOT
+        stopped on server shutdown (correct: outlives the server, ready for
+        the next start).
+      - spawn runlevel launches a child tor owned by this process and is
+        terminated on stop()/atexit.
+    """
+
+    RUNLEVEL_SERVICE = "service"    # preferred when /etc/init.d/tor exists
+    RUNLEVEL_SYSTEMD = "systemctl"  # used when /run/systemd/system present
+    RUNLEVEL_SPAWN = "spawn"        # last resort: raw tor subprocess
+    RUNLEVEL_COMMAND = "command"    # DDG_TOR_START_COMMAND override
+
+    _INITD_TOR = "/etc/init.d/tor"
+    _SYSTEMD_MARKER = "/run/systemd/system"
+
+    def __init__(
+        self,
+        probe_ports: List[str],
+        bootstrap_timeout: float = 60.0,
+        start_command: Optional[str] = None,
+        log: Optional[Callable[[str], None]] = None,
+    ):
+        self._probe_ports = list(probe_ports)
+        self._bootstrap_timeout = float(bootstrap_timeout)
+        self._start_command = start_command
+        self._log = log or (lambda m: None)
+        self._last_runlevel: Optional[str] = None
+        self._spawned_pid: Optional[int] = None
+        self._spawned_tmpdir: Optional[str] = None
+
+    # --- queries ---
+    def detect(self) -> List[str]:
+        """Return currently-open probe ports (TCP probe, same semantics as
+        _probe_tor_ports)."""
+        return _probe_tor_ports(self._probe_ports)
+
+    def is_healthy(self) -> bool:
+        """True iff >=1 probe port accepts TCP. Cheap, no SOCKS handshake."""
+        return bool(self.detect())
+
+    @property
+    def last_runlevel(self) -> Optional[str]:
+        return self._last_runlevel
+
+    @property
+    def spawned_pid(self) -> Optional[int]:
+        return self._spawned_pid
+
+    # --- lifecycle ---
+    def ensure_running(self) -> bool:
+        """Detect; if open ports exist, return True. Otherwise start() via the
+        runlevel fallback chain, then wait_for_bootstrap(). Never raises."""
+        if self.is_healthy():
+            return True
+        ok, _runlevel = self.start()
+        if not ok:
+            return False
+        return self.wait_for_bootstrap()
+
+    def start(self) -> Tuple[bool, str]:
+        """Try COMMAND -> SERVICE -> SYSTEMD -> SPAWN in order. Returns
+        (ok, runlevel). Records last_runlevel / spawned_pid."""
+        # 1. Explicit override (test / custom launcher).
+        if self._start_command:
+            if self._run_command(self._start_command):
+                self._last_runlevel = self.RUNLEVEL_COMMAND
+                self._log(f"starting tor via command: {self._start_command}")
+                return True, self.RUNLEVEL_COMMAND
+            self._log(f"start command failed: {self._start_command}")
+        # 2. SysV init script (non-systemd hosts like WSL2): service tor start.
+        #    Uses the system torrc so /var/lib/tor + /var/log/tor permissions
+        #    are handled by the debian-tor user the service runs as.
+        if os.path.exists(self._INITD_TOR):
+            if self._run_command("sudo -n service tor start"):
+                self._last_runlevel = self.RUNLEVEL_SERVICE
+                self._log("starting tor via service tor start")
+                return True, self.RUNLEVEL_SERVICE
+            self._log("service tor start failed")
+        # 3. systemd (if available in future). Auto-selected by marker file.
+        if os.path.exists(self._SYSTEMD_MARKER):
+            if self._run_command("sudo -n systemctl start tor"):
+                self._last_runlevel = self.RUNLEVEL_SYSTEMD
+                self._log("starting tor via systemctl start tor")
+                return True, self.RUNLEVEL_SYSTEMD
+            self._log("systemctl start tor failed")
+        # 4. Last resort: raw tor subprocess with a user-owned torrc.
+        if self._spawn_raw_tor():
+            self._last_runlevel = self.RUNLEVEL_SPAWN
+            self._log("starting tor via raw subprocess (spawn)")
+            return True, self.RUNLEVEL_SPAWN
+        self._log("all tor start methods failed")
+        return False, ""
+
+    def wait_for_bootstrap(self, timeout: Optional[float] = None) -> bool:
+        """Poll detect() every 0.5s until >=1 port open or timeout. Bounded by
+        bootstrap_timeout (DDG_TOR_BOOTSTRAP_TIMEOUT, default 60)."""
+        deadline = time.monotonic() + float(timeout if timeout is not None else self._bootstrap_timeout)
+        while time.monotonic() < deadline:
+            if self.is_healthy():
+                return True
+            time.sleep(0.5)
+        return self.is_healthy()
+
+    def stop(self) -> None:
+        """Only a tor we spawned is ours to stop. service/systemctl/command-
+        managed daemons are shared system services and must outlive this
+        process. Idempotent, best-effort."""
+        if self._spawned_pid is not None:
+            try:
+                try:
+                    os.kill(self._spawned_pid, 15)  # SIGTERM
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    traceback.print_exc(file=sys.stderr)
+            finally:
+                self._spawned_pid = None
+        if self._spawned_tmpdir:
+            try:
+                shutil.rmtree(self._spawned_tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+            self._spawned_tmpdir = None
+
+    # --- internals ---
+    @staticmethod
+    def _run_command(cmd: str) -> bool:
+        try:
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=90,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    def _spawn_raw_tor(self) -> bool:
+        tor_bin = shutil.which("tor")
+        if not tor_bin:
+            self._log("tor binary not found on PATH")
+            return False
+        # Build a user-writable torrc + DataDirectory + Log so we never touch
+        # /var/lib/tor or /var/log/tor (debian-tor-owned, unreadable here).
+        try:
+            tmp = tempfile.mkdtemp(prefix="ddg-tor-")
+            data_dir = os.path.join(tmp, "data")
+            log_file = os.path.join(tmp, "tor.log")
+            os.makedirs(data_dir, exist_ok=True)
+            seen = set()
+            ports_lines = []
+            for p in self._probe_ports:
+                if p in seen:
+                    continue
+                seen.add(p)
+                host, _, port = p.rpartition(":")
+                ports_lines.append(f"SocksPort {host or '127.0.0.1'}:{port or '9050'}")
+            torrc_path = os.path.join(tmp, "torrc")
+            lines = list(ports_lines) + [
+                f"DataDirectory {data_dir}",
+                f"Log notice file {log_file}",
+                "RunAsDaemon 0",
+                "AvoidDiskWrites 1",
+            ]
+            with open(torrc_path, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            proc = subprocess.Popen(
+                [tor_bin, "-f", torrc_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self._spawned_pid = proc.pid
+            self._spawned_tmpdir = tmp
+            return True
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            return False
+
+
 class DuckDuckGoSearcher:
     DEFAULT_BASE_URL = "https://lite.duckduckgo.com/lite/"
+    # DDG official Onion (Tor) endpoint — CAPTCHA-free. Selected automatically
+    # at startup when a local Tor daemon is detected (DDG_AUTO_TOR) and no
+    # DDG_BASE_URL is explicitly set.
+    DEFAULT_ONION_URL = "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/html/"
+    # SOCKS ports probed for a local Tor daemon (9050 + 9051-9059).
+    DEFAULT_TOR_PROBE_PORTS = [f"127.0.0.1:{p}" for p in range(9050, 9060)]
     RESULTS_PER_PAGE = 10
 
     _USER_AGENTS = [
@@ -193,7 +439,9 @@ class DuckDuckGoSearcher:
         self._last_request_time: Optional[datetime] = None
         self.safe_search = safe_search
         self.default_region = default_region
-        self._vqd_cache: Dict[str, str] = {}
+        # Next form hidden params (vqd/v/o/api/s/dc/kl/nextParams/...) per
+        # query+region, captured from page 1 and replayed for page>=2.
+        self._next_form_cache: Dict[str, Dict[str, str]] = {}
         # Result cache (TTL) so repeated searches return instantly.
         self._result_cache: Dict[str, tuple] = {}
         self._result_cache_ttl = float(os.getenv("DDG_RESULT_CACHE_TTL", "600"))
@@ -205,7 +453,43 @@ class DuckDuckGoSearcher:
         self._retry_base_delay = float(os.getenv("DDG_RETRY_DELAY", "3.0"))
         self._max_retries = int(os.getenv("DDG_MAX_RETRIES", "3"))
         self._proxy = os.getenv("DDG_PROXY", "")
-        self._base_url = os.getenv("DDG_BASE_URL", self.DEFAULT_BASE_URL)
+        # Optional Tor daemon manager (only set when we auto-start tor below).
+        self._tor_manager: Optional["TorDaemonManager"] = None
+        # Determine base URL: explicit DDG_BASE_URL wins; otherwise, when
+        # DDG_AUTO_TOR is enabled (default), probe for a local Tor daemon and
+        # auto-select the CAPTCHA-free Onion route. Falls back to lite when Tor
+        # is unavailable (keeps CI / Tor-less environments working).
+        self._auto_tor_ports: List[str] = []
+        _base_url_env = os.getenv("DDG_BASE_URL")
+        if _base_url_env:
+            self._base_url = _base_url_env
+        elif os.getenv("DDG_AUTO_TOR", "1") != "0":
+            _candidates = [p.strip() for p in os.getenv("DDG_TOR_SOCKS_PORTS", "").split(",") if p.strip()]
+            _candidates = _candidates or self.DEFAULT_TOR_PROBE_PORTS
+            _open_ports = _probe_tor_ports(_candidates)
+            if not _open_ports and os.getenv("DDG_AUTO_TOR_START", "1") != "0":
+                # Tor daemon absent on a non-systemd host (WSL2 etc.) — try to
+                # start it ourselves (service/systemctl/raw spawn) so the
+                # CAPTCHA-free Onion route is available without a manual
+                # `service tor start`. Failure is non-fatal: falls through to
+                # the clearnet lite route below.
+                self._tor_manager = TorDaemonManager(
+                    probe_ports=_candidates,
+                    bootstrap_timeout=float(os.getenv("DDG_TOR_BOOTSTRAP_TIMEOUT", "60")),
+                    start_command=os.getenv("DDG_TOR_START_COMMAND") or None,
+                    log=lambda m: print(f"  [tor] {m}", file=sys.stderr),
+                )
+                if self._tor_manager.ensure_running():
+                    _open_ports = _probe_tor_ports(_candidates)
+                else:
+                    self._tor_manager = None
+            if _open_ports:
+                self._base_url = self.DEFAULT_ONION_URL
+                self._auto_tor_ports = _open_ports
+            else:
+                self._base_url = self.DEFAULT_BASE_URL
+        else:
+            self._base_url = self.DEFAULT_BASE_URL
         # Onion (Tor) route is CAPTCHA-free; primp's fingerprint spoofing is
         # counterproductive there (triggers HTTP 406), so plain httpx is used.
         # The /html/ endpoint uses different markup (result__a) than lite.
@@ -214,16 +498,30 @@ class DuckDuckGoSearcher:
         self._httpx_proxy: Optional[str] = None
         self._rotator = ProxyRotator.from_env()
         # Tor multi-port pool: aggregate bandwidth across independent circuits.
-        # Onion route only. Empty/unset → single DDG_PROXY (legacy behavior).
+        # Onion route only. Uses explicit DDG_TOR_SOCKS_PORTS, or the ports
+        # auto-detected above when DDG_AUTO_TOR selected the Onion route.
         self._tor_pool: Optional["TorPortPool"] = None
         if self._is_onion:
             _ports = [p.strip() for p in os.getenv("DDG_TOR_SOCKS_PORTS", "").split(",") if p.strip()]
+            if not _ports and self._auto_tor_ports:
+                _ports = self._auto_tor_ports
             if _ports:
                 self._tor_pool = TorPortPool(
                     _ports,
                     max_connections_per_port=int(os.getenv("DDG_TOR_MAX_CONNECTIONS_PER_PORT", "4")),
                     throttle_per_port=float(os.getenv("DDG_TOR_THROTTLE_PER_PORT", "0")),
                 )
+        # Onion (Tor) circuit breaker: Tor can lose routing (stale consensus on
+        # an old tor build, circuit rot, daemon restart) while still accepting
+        # SOCKS connections — every request then fails with a SOCKS error
+        # ("TTL expired") or a timeout, and without a fallback the whole server
+        # stays wedged on the dead Onion route. We track consecutive Onion
+        # connection failures; once past the threshold we route through the
+        # clearnet lite route (primp) for a cooldown, then re-probe Tor.
+        self._onion_fail_threshold = int(os.getenv("DDG_ONION_FAIL_THRESHOLD", "3"))
+        self._onion_cooldown = float(os.getenv("DDG_ONION_COOLDOWN", "600"))
+        self._onion_failures = 0
+        self._onion_failed_until: Optional[datetime] = None
         self._batch_concurrency = int(os.getenv("DDG_BATCH_CONCURRENCY", "8"))
         self._batch_max = int(os.getenv("DDG_BATCH_MAX", "100"))
         self._current_proxy: Optional[str] = None
@@ -363,26 +661,77 @@ class DuckDuckGoSearcher:
         self._primp_client = None
         if self._tor_pool:
             await self._tor_pool.close_all()
+        # Stop a tor we spawned (raw-subprocess runlevel only). service/
+        # systemctl-managed daemons are shared and left running.
+        if self._tor_manager:
+            self._tor_manager.stop()
 
-    def _parse_pagination(self, soup: BeautifulSoup) -> tuple[Optional[str], bool]:
-        if self._is_html_endpoint:
-            # /html/ endpoint: the "Next" form posts to /html/ with a vqd input.
-            form = soup.find("form", action="/html/")
-            if not form:
-                return None, False
-            vqd_input = form.find("input", {"name": "vqd"})
-            vqd = vqd_input.get("value", "") if vqd_input else None
-            return (vqd or None), vqd_input is not None
-        # lite endpoint: <form class="next_form">
-        next_form = soup.find("form", class_="next_form")
-        if not next_form:
+    def _parse_pagination(
+        self, soup: BeautifulSoup, html_endpoint: Optional[bool] = None,
+    ) -> tuple[Optional[Dict[str, str]], bool]:
+        """Extract the Next form's hidden params (incl. vqd) for page>1 requests.
+
+        Returns ``(params_dict, has_next_page)``. ``params_dict`` holds every
+        named input of the Next form (``vqd``, ``v``, ``o``, ``api``, ``s``,
+        ``dc``, ``kl``, ``nextParams``, ...). The caller recomputes ``s``/``dc``
+        per page and must NOT add ``kp`` (the ``/html/`` AJAX endpoint returns
+        HTTP 406 when ``kp`` is present).
+
+        The ``/html/`` endpoint renders several ``<form action="/html/">``
+        elements (search box x2 plus the Next form). Only the Next form carries
+        a ``vqd`` input, so we pick that one — using ``find()`` would grab the
+        first search box and lose ``vqd``, which silently broke page>=2 (no
+        cached vqd, has_next stuck False).
+        """
+        is_html = html_endpoint if html_endpoint is not None else self._is_html_endpoint
+        form = None
+        if is_html:
+            for candidate in soup.find_all("form", action="/html/"):
+                if candidate.find("input", {"name": "vqd"}):
+                    form = candidate
+                    break
+        else:
+            # lite endpoint: the single <form class="next_form"> is the Next form.
+            form = soup.find("form", class_="next_form")
+        if form is None:
             return None, False
-        vqd_input = next_form.find("input", {"name": "vqd"})
-        vqd = vqd_input.get("value", "") if vqd_input else None
-        return vqd, True
+        params: Dict[str, str] = {}
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            if not name:
+                continue
+            params[name] = inp.get("value", "") or ""
+        # vqd is mandatory to fetch any later page; without it this isn't a
+        # usable Next form (and likely the last result page).
+        if not params.get("vqd"):
+            return None, False
+        return params, True
 
     def _cache_key(self, query: str, region: str) -> str:
         return f"{query.lower()}|{region}"
+
+    def _build_page_data(
+        self, query: str, region: str, page: int, cache_key: str,
+    ) -> Optional[Dict[str, str]]:
+        """Build the POST body for a given page.
+
+        Page 1: a fresh search (``q``, ``kl``, ``kp``). Page >=2: replay page
+        1's cached Next-form params with ``s``/``dc`` recomputed and ``kp``
+        dropped — the ``/html/`` AJAX endpoint rejects ``kp`` with HTTP 406,
+        and the page-2 ``dc`` is ``s + 1`` (not ``s``). Returns ``None`` when
+        page >=2 but no Next form was cached yet (caller yields empty results).
+        """
+        if page <= 1:
+            return {"q": query, "kl": region, "kp": self.safe_search.value}
+        params = self._next_form_cache.get(cache_key)
+        if not params:
+            return None
+        offset = (page - 1) * self.RESULTS_PER_PAGE
+        data = dict(params)
+        data["q"] = query
+        data["s"] = str(offset)        # number of results to skip
+        data["dc"] = str(offset + 1)   # 1-based index of the next result to show
+        return data
 
     def _is_captcha_page(self, soup: BeautifulSoup) -> bool:
         text = soup.get_text()[:4096]
@@ -433,8 +782,11 @@ class DuckDuckGoSearcher:
             out.append((title, link, snippet))
         return out
 
-    def _extract_results(self, soup: BeautifulSoup) -> List["SearchResult"]:
-        raw = self._extract_html_endpoint(soup) if self._is_html_endpoint else self._extract_lite(soup)
+    def _extract_results(
+        self, soup: BeautifulSoup, html_endpoint: Optional[bool] = None,
+    ) -> List["SearchResult"]:
+        is_html = html_endpoint if html_endpoint is not None else self._is_html_endpoint
+        raw = self._extract_html_endpoint(soup) if is_html else self._extract_lite(soup)
         return [
             SearchResult(title=t, link=u, snippet=s, position=i + 1)
             for i, (t, u, s) in enumerate(raw)
@@ -494,7 +846,17 @@ class DuckDuckGoSearcher:
             port, client = await self._tor_pool.acquire()
             try:
                 response = await client.post(self._base_url, data=data, headers=headers)
+                self._onion_failures = 0  # any response = Tor is routing
                 return response.status_code, response.text
+            except Exception:
+                # Dead Tor circuit / SOCKS error ("TTL expired") / timeout, or a
+                # socksio-specific error. Drop this port's cached client — the
+                # pool otherwise keeps reusing the dead circuit's pooled
+                # connection and every request fails until it's rebuilt.
+                # Re-raised (not swallowed) so the caller trips the circuit
+                # breaker and falls back to clearnet.
+                await self._tor_pool.reset_port(port)
+                raise
             finally:
                 self._tor_pool.release(port)
         # Determine proxy for this request
@@ -526,28 +888,116 @@ class DuckDuckGoSearcher:
         await self._maybe_rotate_session()
         return response.status_code, response.text
 
+    def _onion_available(self) -> bool:
+        """Whether the Onion (Tor) route should be attempted.
+
+        False while the circuit breaker is active (Tor lost routing). Once the
+        cooldown elapses the breaker clears and Tor gets a fresh chance.
+        """
+        if self._onion_failed_until is None:
+            return True
+        if datetime.now() >= self._onion_failed_until:
+            self._onion_failed_until = None
+            self._onion_failures = 0
+            return True
+        return False
+
+    async def _clearnet_fallback_search(
+        self, query: str, ctx: Context, region: str, page: int,
+    ) -> tuple[List[SearchResult], bool, Optional[str]]:
+        """Serve a query over clearnet lite when the Tor Onion route is down.
+
+        Fully independent of the Onion base URL/parser: always targets
+        lite.duckduckgo.com/lite/ over a fresh primp client (no proxy), parses
+        with the lite markup, and owns its own CAPTCHA/202/429 retry. Building a
+        local client per call avoids races on shared primp state when several
+        search_batch queries fall back concurrently.
+        """
+        # Clearnet shares the global throttle (TorPortPool normally bypasses it).
+        await self._throttle()
+        cache_key = self._cache_key(query, region)
+        data = self._build_page_data(query, region, page, cache_key)
+        if data is None:
+            return [], False, None
+        headers = self._build_headers(region)
+        safe_headers = {
+            k: v for k, v in headers.items()
+            if k.lower() not in ("user-agent", "accept-encoding", "referer")
+        }
+        await ctx.info(f"Clearnet fallback (lite/primp) for: {query}")
+
+        for attempt in range(self._max_retries + 1):
+            try:
+                def _sync_request():
+                    import primp
+                    client = primp.Client(impersonate="random", impersonate_os="random", timeout=30)
+                    if safe_headers:
+                        client.headers_update(safe_headers)
+                    if self._warmup_enabled:
+                        try:
+                            client.request("GET", self.DEFAULT_BASE_URL)
+                        except Exception:
+                            pass
+                    resp = client.request("POST", self.DEFAULT_BASE_URL, data=data)
+                    return resp.status_code, resp.text
+
+                status_code, response_text = await asyncio.to_thread(_sync_request)
+            except Exception as e:
+                if attempt < self._max_retries:
+                    await asyncio.sleep(self._retry_base_delay * (2 ** attempt))
+                    continue
+                return [], False, f"Clearnet fallback request failed: {e}"
+
+            if status_code != 200:
+                if attempt < self._max_retries and status_code in (202, 429, 403):
+                    await asyncio.sleep(self._retry_base_delay * (2 ** attempt))
+                    continue
+                return [], False, response_text[:2000] if response_text else f"HTTP {status_code}"
+
+            soup = BeautifulSoup(response_text, "html.parser")
+            if not soup:
+                return [], False, None
+            if self._is_captcha_page(soup):
+                if attempt < self._max_retries:
+                    await asyncio.sleep(self._retry_base_delay * (2 ** attempt))
+                    continue
+                return [], False, soup.get_text(separator="\n", strip=True)[:2000]
+            next_params, has_next_page = self._parse_pagination(soup, html_endpoint=False)
+            if next_params:
+                self._next_form_cache[cache_key] = next_params
+            results = self._extract_results(soup, html_endpoint=False)
+            if results:
+                return results, has_next_page, None
+            page_text = soup.get_text(separator="\n", strip=True)[:2000]
+            return [], has_next_page, page_text if page_text else None
+
+        return [], False, "Clearnet fallback: max retries exceeded"
+
     async def _fetch_results(
         self, query: str, ctx: Context, region: str, page: int = 1,
+        _fallback_depth: int = 0,
     ) -> tuple[List[SearchResult], bool, Optional[str]]:
         try:
+            # Circuit breaker: if Tor has lost routing (stale consensus, dead
+            # circuits after a long uptime), serving over the Onion route would
+            # just time out / return SOCKS "TTL expired" forever. Fall back to
+            # clearnet lite until the cooldown elapses. Bounded by
+            # _fallback_depth to prevent recursion.
+            if (
+                self._tor_pool is not None
+                and _fallback_depth == 0
+                and not self._onion_available()
+            ):
+                await ctx.info("Tor route unavailable — serving via clearnet (lite)")
+                return await self._clearnet_fallback_search(query, ctx, region, page)
             if self._tor_pool is None:
                 await self._throttle()  # TorPortPool handles per-port timing
 
             cache_key = self._cache_key(query, region)
 
-            data: Dict[str, str] = {
-                "q": query,
-                "kl": region,
-                "kp": self.safe_search.value,
-            }
-
-            if page > 1:
-                vqd = self._vqd_cache.get(cache_key)
-                if not vqd:
-                    return [], False, None
-                data["s"] = str((page - 1) * self.RESULTS_PER_PAGE)
-                data["vqd"] = vqd
-                data["dc"] = str((page - 1) * self.RESULTS_PER_PAGE)
+            data = self._build_page_data(query, region, page, cache_key)
+            if data is None:
+                return [], False, None
 
             await ctx.info(
                 f"Searching DuckDuckGo for: {query} "
@@ -585,9 +1035,9 @@ class DuckDuckGoSearcher:
                         page_text = soup.get_text(separator="\n", strip=True)[:2000]
                         return [], False, page_text
 
-                    vqd, has_next_page = self._parse_pagination(soup)
-                    if vqd:
-                        self._vqd_cache[cache_key] = vqd
+                    next_params, has_next_page = self._parse_pagination(soup)
+                    if next_params:
+                        self._next_form_cache[cache_key] = next_params
 
                     results = self._extract_results(soup)
 
@@ -633,6 +1083,39 @@ class DuckDuckGoSearcher:
             return [], False, response_text[:2000] if response_text else "Max retries exceeded"
 
         except Exception as e:
+            # Onion (Tor) route: circuit/SOCKS errors (timeouts, "TTL expired").
+            # _do_request already recycled the dead port client. Count the
+            # failure, trip the circuit breaker on a prolonged outage, and serve
+            # THIS query over clearnet so a transient or total Tor failure never
+            # wedges the search. Bounded by _fallback_depth (no recursion).
+            if (
+                self._tor_pool is not None
+                and self._rotator is None
+                and _fallback_depth == 0
+            ):
+                self._onion_failures += 1
+                if self._onion_failures >= self._onion_fail_threshold:
+                    self._onion_failed_until = datetime.now() + timedelta(seconds=self._onion_cooldown)
+                    # Extension point: if runtime tor daemon restart is ever
+                    # needed (permanently dead daemon), hook
+                    # self._tor_manager.restart() here. Not implemented — the
+                    # breaker + reset_port recover transient circuit rot, and
+                    # the next server restart re-runs ensure_running() for a
+                    # fully dead daemon.
+                    await ctx.info(
+                        f"Tor unhealthy ({self._onion_failures} consecutive errors) — "
+                        f"clearnet fallback for {int(self._onion_cooldown)}s. ({e})"
+                    )
+                else:
+                    await ctx.info(
+                        f"Tor transient error {self._onion_failures}/{self._onion_fail_threshold}: {e} "
+                        f"— serving this query via clearnet."
+                    )
+                try:
+                    return await self._clearnet_fallback_search(query, ctx, region, page)
+                except Exception as e2:
+                    traceback.print_exc(file=sys.stderr)
+                    return [], False, f"Tor error ({e}); clearnet fallback also failed: {e2}"
             # Connection errors with proxy pool: mark proxy and retry
             if self._rotator and self._current_proxy:
                 self._rotator.mark_blocked(self._current_proxy)
@@ -644,9 +1127,9 @@ class DuckDuckGoSearcher:
                         if status_code == 200:
                             soup = BeautifulSoup(response_text, "html.parser")
                             if soup and not self._is_captcha_page(soup):
-                                vqd, has_next_page = self._parse_pagination(soup)
-                                if vqd:
-                                    self._vqd_cache[cache_key] = vqd
+                                next_params, has_next_page = self._parse_pagination(soup)
+                                if next_params:
+                                    self._next_form_cache[cache_key] = next_params
                                 results = self._extract_results(soup)
                                 if results:
                                     return results, has_next_page, None
@@ -886,9 +1369,30 @@ except KeyError:
 searcher = DuckDuckGoSearcher(safe_search=safe_search, default_region=REGION_CODE)
 fetcher = WebContentFetcher()
 
+# Stop a tor we spawned (raw-subprocess runlevel only) on interpreter exit.
+# service/systemctl-managed daemons are shared and left running. Best-effort.
+def _shutdown_tor_manager():
+    try:
+        if searcher._tor_manager:
+            searcher._tor_manager.stop()
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_tor_manager)
+
 print(f"DuckDuckGo MCP Server initialized:", file=sys.stderr)
 print(f"  SafeSearch: {safe_search.name} (kp={safe_search.value})", file=sys.stderr)
 print(f"  Default Region: {REGION_CODE or 'none'}", file=sys.stderr)
+_route = "onion(Tor)" if searcher._is_onion else "lite(primp)"
+_nports = len(searcher._tor_pool._ports) if searcher._tor_pool else 0
+_via = f" via {_nports} port(s)" if searcher._tor_pool else ""
+print(f"  Route: {_route}{_via}", file=sys.stderr)
+if searcher._tor_manager and searcher._tor_manager.last_runlevel:
+    print(
+        f"  Tor auto-started via {searcher._tor_manager.last_runlevel}",
+        file=sys.stderr,
+    )
 
 
 @mcp.tool()
@@ -914,7 +1418,7 @@ async def search(query: str, ctx: Context, region: str = "", page: int = 1) -> s
 
 
 @mcp.tool()
-async def search_batch(queries: List[str], ctx: Context, region: str = "") -> str:
+async def search_batch(queries: List[str], ctx: Context, region: str = "", page: int = 1) -> str:
     """Search multiple queries in parallel over the configured route (Tor Onion or clearnet).
 
     Returns combined per-query results — much faster than N sequential search()
@@ -926,6 +1430,11 @@ async def search_batch(queries: List[str], ctx: Context, region: str = "") -> st
     Args:
         queries: List of search query strings.
         region: Optional region/language code (see search()). Leave empty for server default.
+        page: Page number for pagination (default: 1). The same page is fetched
+            for every query. To retrieve page 2+, first call with page=1 (which
+            caches each query's Next-form params in-process), then call again
+            with page=2 — page>=2 requires page 1 of the same query to have
+            been fetched in the same server process.
         ctx: MCP context for logging.
     """
     if not queries:
@@ -940,7 +1449,7 @@ async def search_batch(queries: List[str], ctx: Context, region: str = "") -> st
 
     async def _one(q):
         async with sem:
-            return await searcher.search(q, ctx, region)
+            return await searcher.search(q, ctx, region, page)
 
     outcomes = await asyncio.gather(*[_one(q) for q in queries], return_exceptions=True)
     sections = []
@@ -955,7 +1464,7 @@ async def search_batch(queries: List[str], ctx: Context, region: str = "") -> st
         if not results:
             sections.append(f"## {q}\nNo results were found for this query.")
             continue
-        sections.append(f"## {q}\n" + searcher.format_results_for_llm(results, has_next_page=has_next))
+        sections.append(f"## {q}\n" + searcher.format_results_for_llm(results, page=page, has_next_page=has_next))
     return "\n\n---\n\n".join(sections)
 
 

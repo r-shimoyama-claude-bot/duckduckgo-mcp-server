@@ -259,6 +259,41 @@ Cleaned and formatted text content from the webpage.
 - Detailed logging through MCP context
 - Graceful degradation on rate limits or timeouts
 
+### Tor / Onion Route (optional, CAPTCHA-free)
+
+For high-volume use the clearnet route can hit DuckDuckGo's CAPTCHA / rate
+limits. Routing through Tor to DDG's official Onion endpoint is CAPTCHA-free
+and makes `search_batch` much faster (multiple SOCKS ports = aggregated
+bandwidth across independent circuits).
+
+The server manages Tor for you when possible — no manual `service tor start`
+needed:
+
+1. Install Tor and configure SOCKS ports (≥ Tor 0.4.7):
+   ```bash
+   sudo apt install tor
+   # torrc: one SocksPort per parallel circuit (see torrc.example)
+   SocksPort 9051
+   SocksPort 9052
+   # ... up to 9059
+   ```
+2. Point the server at those ports in `.env`:
+   ```bash
+   DDG_TOR_SOCKS_PORTS=127.0.0.1:9051,127.0.0.1:9052,127.0.0.1:9053
+   DDG_BATCH_CONCURRENCY=8
+   ```
+3. Just start the server. At startup it probes those ports; if Tor isn't
+   running yet, `DDG_AUTO_TOR_START=1` (default) starts it automatically via
+   `service tor start` → `systemctl start tor` → a raw `tor` subprocess, then
+   waits up to `DDG_TOR_BOOTSTRAP_TIMEOUT` (default 60s) for the SOCKS ports
+   to open. This is what keeps the Onion route available on non-systemd hosts
+   (e.g. WSL2) where Tor isn't launched at boot.
+
+If Tor is unavailable (not installed, blocked, bootstrap timeout), the server
+transparently falls back to the clearnet lite route so it always works. A
+circuit breaker tracks Tor health at runtime and falls back to clearnet per
+query on failures. Set `DDG_AUTO_TOR_START=0` to disable auto-start.
+
 ## Contributing
 
 Issues and pull requests are welcome! Some areas for potential improvement:

@@ -18,6 +18,7 @@ from duckduckgo_mcp_server.server import (
     SafeSearchMode,
     SearchResult,
     SUPPORTED_FETCH_BACKENDS,
+    TorDaemonManager,
     WebContentFetcher,
 )
 
@@ -956,6 +957,36 @@ class TestHtmlEndpointParsing(unittest.TestCase):
     </body></html>
     """
 
+    # Closer to the real /html/ page: two search-box forms (no vqd) render
+    # before the Next form. The old soup.find() picked the first one and lost vqd.
+    HTML_REALISTIC = """
+    <html><body>
+      <form action="/html/" class="header__form">
+        <input name="q" value="t">
+        <input type="submit" value="S">
+      </form>
+      <form action="/html/">
+        <input name="q" value="t">
+      </form>
+      <div class="results">
+        <div class="result results_links">
+          <h2 class="result__title"><a class="result__a" href="https://example.com/1">Title One</a></h2>
+        </div>
+      </div>
+      <form action="/html/">
+        <input name="q" value="t">
+        <input name="s" value="10">
+        <input name="nextParams" value="">
+        <input name="v" value="l">
+        <input name="o" value="json">
+        <input name="dc" value="11">
+        <input name="api" value="d.js">
+        <input name="vqd" value="4-9988776655">
+        <input name="kl" value="us-en">
+      </form>
+    </body></html>
+    """
+
     def setUp(self):
         self.s = _make_searcher()
         self.s._is_html_endpoint = True
@@ -976,9 +1007,55 @@ class TestHtmlEndpointParsing(unittest.TestCase):
         self.assertEqual(results[1].title, "Title Two")
 
     def test_parse_pagination_returns_html_vqd(self):
-        vqd, has_next = self.s._parse_pagination(self.soup)
-        self.assertEqual(vqd, "4-1234567890")
+        next_params, has_next = self.s._parse_pagination(self.soup)
         self.assertTrue(has_next)
+        self.assertEqual(next_params["vqd"], "4-1234567890")
+        self.assertEqual(next_params["s"], "20")
+        self.assertEqual(next_params["q"], "t")
+
+    def test_parse_pagination_skips_search_box_forms(self):
+        """The /html/ endpoint renders search-box forms (no vqd) before the
+        Next form. _parse_pagination must pick the form that carries vqd, not
+        the first action="/html/" form — otherwise vqd is lost and page>=2
+        silently returns empty (the original bug)."""
+        soup = BeautifulSoup(self.HTML_REALISTIC, "html.parser")
+        next_params, has_next = self.s._parse_pagination(soup)
+        self.assertTrue(has_next)
+        self.assertEqual(next_params["vqd"], "4-9988776655")
+        self.assertEqual(next_params["v"], "l")
+        self.assertEqual(next_params["o"], "json")
+        self.assertEqual(next_params["api"], "d.js")
+        self.assertEqual(next_params["kl"], "us-en")
+
+    def test_build_page_data_page2_drops_kp_and_sets_s_dc(self):
+        """page>=2 replays cached Next-form params, recomputes s/dc, and omits
+        kp — the /html/ AJAX endpoint returns HTTP 406 when kp is present."""
+        s = self.s
+        key = s._cache_key("t", "us-en")
+        s._next_form_cache[key] = {
+            "q": "t", "s": "10", "dc": "11", "vqd": "4-x",
+            "v": "l", "o": "json", "api": "d.js", "kl": "us-en", "nextParams": "",
+        }
+        # page 1: fresh search carrying kp (SafeSearch)
+        d1 = s._build_page_data("t", "us-en", 1, key)
+        self.assertEqual(d1, {"q": "t", "kl": "us-en", "kp": s.safe_search.value})
+        # page 2: replay next-form params; s=(2-1)*10=10, dc=11 (s+1), NO kp
+        d2 = s._build_page_data("t", "us-en", 2, key)
+        self.assertNotIn("kp", d2)
+        self.assertEqual(d2["s"], "10")
+        self.assertEqual(d2["dc"], "11")
+        self.assertEqual(d2["vqd"], "4-x")
+        self.assertEqual(d2["v"], "l")
+        self.assertEqual(d2["o"], "json")
+        self.assertEqual(d2["api"], "d.js")
+        # page 3: offset advances to 20 / 21
+        d3 = s._build_page_data("t", "us-en", 3, key)
+        self.assertEqual(d3["s"], "20")
+        self.assertEqual(d3["dc"], "21")
+        self.assertNotIn("kp", d3)
+        # page>=2 with no cached next-form params → None (caller yields empty)
+        s._next_form_cache.clear()
+        self.assertIsNone(s._build_page_data("t", "us-en", 2, key))
 
     def test_decode_ddg_redirect(self):
         decode = DuckDuckGoSearcher._decode_ddg_redirect
@@ -1020,6 +1097,111 @@ class TestOnionBackendSelection(unittest.TestCase):
                 os.environ.pop("DDG_BASE_URL", None)
             else:
                 os.environ["DDG_BASE_URL"] = old
+
+
+class TestAutoTorDetection(unittest.TestCase):
+    """DDG_AUTO_TOR: probe Tor at startup and auto-select the Onion route.
+
+    conftest.py pins DDG_AUTO_TOR=0 + lite for the whole suite; these tests
+    flip the flag back on and mock _probe_tor_ports to avoid real sockets.
+    """
+
+    _keys = ("DDG_AUTO_TOR", "DDG_AUTO_TOR_START", "DDG_BASE_URL", "DDG_TOR_SOCKS_PORTS")
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in self._keys}
+        os.environ.pop("DDG_BASE_URL", None)
+        os.environ.pop("DDG_TOR_SOCKS_PORTS", None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_auto_tor_disabled_uses_lite(self):
+        os.environ["DDG_AUTO_TOR"] = "0"
+        with patch("duckduckgo_mcp_server.server._probe_tor_ports") as probe:
+            s = DuckDuckGoSearcher()
+        probe.assert_not_called()
+        self.assertFalse(s._is_onion)
+        self.assertEqual(s._base_url, DuckDuckGoSearcher.DEFAULT_BASE_URL)
+
+    def test_auto_tor_on_with_tor_uses_onion(self):
+        os.environ["DDG_AUTO_TOR"] = "1"
+        with patch(
+            "duckduckgo_mcp_server.server._probe_tor_ports",
+            return_value=["127.0.0.1:9051", "127.0.0.1:9052"],
+        ):
+            s = DuckDuckGoSearcher()
+        self.assertTrue(s._is_onion)
+        self.assertTrue(s._is_html_endpoint)
+        self.assertEqual(s._base_url, DuckDuckGoSearcher.DEFAULT_ONION_URL)
+        self.assertIsNotNone(s._tor_pool)
+        self.assertEqual(s._tor_pool._ports, ["127.0.0.1:9051", "127.0.0.1:9052"])
+
+    def test_auto_tor_on_without_tor_uses_lite(self):
+        os.environ["DDG_AUTO_TOR"] = "1"
+        os.environ["DDG_AUTO_TOR_START"] = "0"
+        with patch("duckduckgo_mcp_server.server._probe_tor_ports", return_value=[]):
+            s = DuckDuckGoSearcher()
+        self.assertFalse(s._is_onion)
+        self.assertEqual(s._base_url, DuckDuckGoSearcher.DEFAULT_BASE_URL)
+        self.assertIsNone(s._tor_pool)
+        self.assertIsNone(s._tor_manager)
+
+    def test_explicit_base_url_overrides_auto_tor(self):
+        os.environ["DDG_AUTO_TOR"] = "1"
+        os.environ["DDG_AUTO_TOR_START"] = "1"
+        os.environ["DDG_BASE_URL"] = "https://lite.duckduckgo.com/lite/"
+        with patch("duckduckgo_mcp_server.server._probe_tor_ports") as probe:
+            s = DuckDuckGoSearcher()
+        probe.assert_not_called()
+        self.assertFalse(s._is_onion)
+        self.assertIsNone(s._tor_manager)
+
+    def test_auto_tor_start_disabled_skips_manager(self):
+        os.environ["DDG_AUTO_TOR"] = "1"
+        os.environ["DDG_AUTO_TOR_START"] = "0"
+        with patch("duckduckgo_mcp_server.server._probe_tor_ports", return_value=[]), \
+             patch("duckduckgo_mcp_server.server.TorDaemonManager") as MgrCls:
+            s = DuckDuckGoSearcher()
+        MgrCls.assert_not_called()
+        self.assertFalse(s._is_onion)
+        self.assertIsNone(s._tor_manager)
+
+    def test_auto_tor_start_invokes_manager_when_probe_empty(self):
+        os.environ["DDG_AUTO_TOR"] = "1"
+        os.environ["DDG_AUTO_TOR_START"] = "1"
+        # First probe (init) finds nothing; manager starts tor; second probe
+        # (re-probe after ensure_running) finds the now-open port.
+        with patch(
+            "duckduckgo_mcp_server.server._probe_tor_ports",
+            side_effect=[[], ["127.0.0.1:9051"]],
+        ), patch("duckduckgo_mcp_server.server.TorDaemonManager") as MgrCls:
+            mgr = MgrCls.return_value
+            mgr.ensure_running.return_value = True
+            mgr.last_runlevel = "service"
+            s = DuckDuckGoSearcher()
+        MgrCls.assert_called_once()
+        mgr.ensure_running.assert_called_once()
+        self.assertTrue(s._is_onion)
+        self.assertEqual(s._auto_tor_ports, ["127.0.0.1:9051"])
+        self.assertIs(s._tor_manager, mgr)
+
+    def test_auto_tor_start_failure_falls_back_to_lite(self):
+        os.environ["DDG_AUTO_TOR"] = "1"
+        os.environ["DDG_AUTO_TOR_START"] = "1"
+        with patch("duckduckgo_mcp_server.server._probe_tor_ports", return_value=[]), \
+             patch("duckduckgo_mcp_server.server.TorDaemonManager") as MgrCls:
+            mgr = MgrCls.return_value
+            mgr.ensure_running.return_value = False
+            s = DuckDuckGoSearcher()
+        mgr.ensure_running.assert_called_once()
+        self.assertFalse(s._is_onion)
+        self.assertEqual(s._base_url, DuckDuckGoSearcher.DEFAULT_BASE_URL)
+        self.assertIsNone(s._tor_manager)
 
 
 class TestResultCache(unittest.TestCase):
@@ -1103,6 +1285,36 @@ class TestSearchBatch(unittest.TestCase):
             result = asyncio.run(run())
         self.assertIn("T-good", result)
         self.assertIn("Error: boom", result)
+
+    def test_batch_passes_page_to_search(self):
+        """search_batch's page arg is forwarded to searcher.search() for every
+        query, and the page number is reflected in the formatted output."""
+        ctx = MagicMock()
+        ctx.info = AsyncMock()
+
+        seen = []
+
+        async def fake_search(query, c, region="", page=1):
+            seen.append((query, page))
+            return (
+                [SearchResult(title=f"T-{query}-p{page}", link=f"https://{query}/",
+                              snippet="s", position=1)],
+                True,  # has_next
+                None,
+            )
+
+        with patch.object(duckduckgo_mcp_server.server.searcher, "search", side_effect=fake_search):
+            async def run():
+                return await duckduckgo_mcp_server.server.search_batch(
+                    ["a", "b"], ctx, region="us-en", page=2,
+                )
+            result = asyncio.run(run())
+        # page forwarded to every query
+        self.assertEqual(seen, [("a", 2), ("b", 2)])
+        # page number reflected in output
+        self.assertIn("(page 2)", result)
+        self.assertIn("T-a-p2", result)
+        self.assertIn("Use page=3", result)
 
 
 class TestTorPortPool(unittest.TestCase):
@@ -1205,4 +1417,277 @@ class TestSearchBatchConcurrency(unittest.TestCase):
         finally:
             duckduckgo_mcp_server.server.searcher._batch_concurrency = original
         self.assertLessEqual(state["max"], 3)
+
+
+def _make_onion_searcher(threshold: int = 3) -> DuckDuckGoSearcher:
+    """A lite searcher with a TorPortPool attached, simulating the Onion route.
+
+    Used to exercise the circuit-breaker / clearnet-fallback logic without a
+    real Tor daemon: _do_request and _clearnet_fallback_search are mocked per
+    test. The Onion except-branch keys on `_tor_pool is not None and not
+    _rotator`, so attaching the pool is enough to enter that path.
+    """
+    from duckduckgo_mcp_server.server import TorPortPool
+    s = _make_searcher()
+    s._tor_pool = TorPortPool(["127.0.0.1:9050"])
+    s._is_onion = True
+    s._onion_fail_threshold = threshold
+    s._onion_cooldown = 600.0
+    s._onion_failures = 0
+    s._onion_failed_until = None
+    return s
+
+
+class TestOnionCircuitBreaker(unittest.TestCase):
+    """When Tor loses routing (consensus failure / dead circuits), the Onion
+    route errors out on every request. The breaker must fall back to clearnet
+    instead of wedging the server — the original cause of the 3h outage."""
+
+    def test_onion_available_default_true(self):
+        s = _make_onion_searcher()
+        self.assertTrue(s._onion_available())
+        self.assertIsNone(s._onion_failed_until)
+
+    def test_onion_available_false_while_tripped(self):
+        s = _make_onion_searcher()
+        s._onion_failed_until = datetime.now() + timedelta(seconds=300)
+        self.assertFalse(s._onion_available())
+
+    def test_onion_available_resets_after_cooldown(self):
+        s = _make_onion_searcher()
+        s._onion_failures = 5
+        s._onion_failed_until = datetime.now() - timedelta(seconds=1)  # expired
+        self.assertTrue(s._onion_available())
+        self.assertIsNone(s._onion_failed_until)
+        self.assertEqual(s._onion_failures, 0)
+
+    def test_onion_error_falls_back_to_clearnet(self):
+        s = _make_onion_searcher(threshold=5)
+        fallback = ([SearchResult(title="cb", link="https://cb/", snippet="", position=1)], False, None)
+        with patch.object(s, "_do_request", side_effect=httpx.ConnectError("SOCKS TTL expired")), \
+             patch.object(s, "_clearnet_fallback_search", new=AsyncMock(return_value=fallback)) as fb, \
+             patch("asyncio.sleep", new=AsyncMock()):
+            async def run():
+                return await s._fetch_results("query", DummyCtx(), "us-en", 1)
+            results, has_next, raw = asyncio.run(run())
+        self.assertEqual(results, fallback[0])
+        self.assertEqual(s._onion_failures, 1)
+        self.assertIsNone(s._onion_failed_until)  # below threshold → not tripped
+        fb.assert_awaited_once()
+
+    def test_repeated_onion_errors_trip_breaker(self):
+        s = _make_onion_searcher(threshold=2)
+        fallback = ([SearchResult(title="cb", link="https://cb/", snippet="", position=1)], False, None)
+        ctx = DummyCtx()
+        with patch.object(s, "_do_request", side_effect=httpx.ReadTimeout("circuit dead")), \
+             patch.object(s, "_clearnet_fallback_search", new=AsyncMock(return_value=fallback)), \
+             patch("asyncio.sleep", new=AsyncMock()):
+            async def run():
+                await s._fetch_results("q1", ctx, "us-en", 1)
+                await s._fetch_results("q2", ctx, "us-en", 1)
+            asyncio.run(run())
+        self.assertIsNotNone(s._onion_failed_until)
+        self.assertGreater(s._onion_failed_until, datetime.now() + timedelta(seconds=300))
+
+    def test_tripped_breaker_skips_onion_entirely(self):
+        s = _make_onion_searcher()
+        s._onion_failed_until = datetime.now() + timedelta(seconds=300)  # tripped
+        fallback = ([SearchResult(title="cb", link="https://cb/", snippet="", position=1)], False, None)
+        do_req = AsyncMock()
+        with patch.object(s, "_do_request", do_req), \
+             patch.object(s, "_clearnet_fallback_search", new=AsyncMock(return_value=fallback)) as fb:
+            async def run():
+                return await s._fetch_results("query", DummyCtx(), "us-en", 1)
+            results, _, _ = asyncio.run(run())
+        self.assertEqual(results, fallback[0])
+        do_req.assert_not_awaited()  # Onion never attempted while breaker active
+        fb.assert_awaited_once()
+
+
+class TestTorPortPoolReset(unittest.TestCase):
+    """reset_port drops the cached client so dead Tor circuits aren't reused."""
+
+    def test_reset_port_drops_cached_client(self):
+        async def run():
+            from duckduckgo_mcp_server.server import TorPortPool
+            pool = TorPortPool(["127.0.0.1:9050", "127.0.0.1:9051"])
+            port, client = await pool.acquire()
+            self.assertIn(port, pool._clients)
+            self.assertIs(pool._clients[port], client)
+            await pool.reset_port(port)
+            self.assertNotIn(port, pool._clients)
+            await pool.close_all()
+        asyncio.run(run())
+
+    def test_reset_port_idempotent_when_no_client(self):
+        async def run():
+            from duckduckgo_mcp_server.server import TorPortPool
+            pool = TorPortPool(["127.0.0.1:9050"])
+            await pool.reset_port("127.0.0.1:9050")  # never acquired — no-op
+            await pool.close_all()
+        asyncio.run(run())
+
+    def test_reset_all_clears_every_client(self):
+        async def run():
+            from duckduckgo_mcp_server.server import TorPortPool
+            pool = TorPortPool(["127.0.0.1:9050", "127.0.0.1:9051"])
+            await pool.acquire()
+            await pool.acquire()
+            self.assertEqual(len(pool._clients), 2)
+            await pool.reset_all()
+            self.assertEqual(pool._clients, {})
+        asyncio.run(run())
+
+
+class TestTorDaemonManager(unittest.TestCase):
+    """TorDaemonManager: Tor auto-start helper (service/systemctl/spawn).
+
+    Every external call (subprocess, shutil.which, os.path.exists, the port
+    probe, time) is mocked — no real tor process is ever launched.
+    """
+
+    def test_detect_uses_probe_tor_ports(self):
+        m = TorDaemonManager(probe_ports=["127.0.0.1:9051"])
+        with patch(
+            "duckduckgo_mcp_server.server._probe_tor_ports",
+            return_value=["127.0.0.1:9051"],
+        ) as probe:
+            self.assertEqual(m.detect(), ["127.0.0.1:9051"])
+        probe.assert_called_once_with(["127.0.0.1:9051"])
+
+    def test_ensure_running_skips_start_when_already_up(self):
+        m = TorDaemonManager(probe_ports=["127.0.0.1:9051"])
+        with patch.object(m, "is_healthy", return_value=True), \
+                patch.object(m, "start") as start:
+            self.assertTrue(m.ensure_running())
+        start.assert_not_called()
+
+    def test_start_uses_service_when_initd_present(self):
+        m = TorDaemonManager(probe_ports=["127.0.0.1:9051"])
+        with patch(
+            "duckduckgo_mcp_server.server.os.path.exists",
+            side_effect=lambda p: p == TorDaemonManager._INITD_TOR,
+        ), patch("duckduckgo_mcp_server.server.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0)
+            ok, lvl = m.start()
+        self.assertTrue(ok)
+        self.assertEqual(lvl, TorDaemonManager.RUNLEVEL_SERVICE)
+        self.assertIn("service tor start", run.call_args_list[0].args[0])
+        self.assertEqual(run.call_count, 1)
+
+    def test_start_uses_systemctl_when_systemd_present(self):
+        m = TorDaemonManager(probe_ports=["127.0.0.1:9051"])
+        with patch(
+            "duckduckgo_mcp_server.server.os.path.exists",
+            side_effect=lambda p: p == TorDaemonManager._SYSTEMD_MARKER,
+        ), patch("duckduckgo_mcp_server.server.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0)
+            ok, lvl = m.start()
+        self.assertTrue(ok)
+        self.assertEqual(lvl, TorDaemonManager.RUNLEVEL_SYSTEMD)
+        self.assertIn("systemctl start tor", run.call_args_list[0].args[0])
+
+    def test_start_spawns_raw_tor_as_last_resort(self):
+        m = TorDaemonManager(probe_ports=["127.0.0.1:9051"])
+        with patch("duckduckgo_mcp_server.server.os.path.exists", return_value=False), \
+                patch("duckduckgo_mcp_server.server.shutil.which", return_value="/usr/sbin/tor"), \
+                patch("duckduckgo_mcp_server.server.subprocess.Popen") as popen, \
+                patch("duckduckgo_mcp_server.server.tempfile.mkdtemp", return_value="/tmp/ddg-tor-test"), \
+                patch("duckduckgo_mcp_server.server.os.makedirs"), \
+                patch("builtins.open", MagicMock()):
+            popen.return_value = MagicMock(pid=12345)
+            ok, lvl = m.start()
+        self.assertTrue(ok)
+        self.assertEqual(lvl, TorDaemonManager.RUNLEVEL_SPAWN)
+        self.assertEqual(m.spawned_pid, 12345)
+        cmdlist = popen.call_args.args[0]
+        self.assertEqual(cmdlist[0], "/usr/sbin/tor")
+        self.assertEqual(cmdlist[1], "-f")
+        self.assertIn("torrc", cmdlist[2])
+
+    def test_start_command_override_wins(self):
+        m = TorDaemonManager(
+            probe_ports=["127.0.0.1:9051"], start_command="/opt/launch-tor.sh"
+        )
+        with patch("duckduckgo_mcp_server.server.os.path.exists") as ex, \
+                patch("duckduckgo_mcp_server.server.subprocess.run") as run, \
+                patch("duckduckgo_mcp_server.server.shutil.which") as which, \
+                patch("duckduckgo_mcp_server.server.subprocess.Popen") as popen:
+            run.return_value = MagicMock(returncode=0)
+            ok, lvl = m.start()
+        self.assertTrue(ok)
+        self.assertEqual(lvl, TorDaemonManager.RUNLEVEL_COMMAND)
+        self.assertEqual(run.call_args_list[0].args[0], "/opt/launch-tor.sh")
+        ex.assert_not_called()
+        which.assert_not_called()
+        popen.assert_not_called()
+
+    def test_wait_for_bootstrap_polls_until_port_open(self):
+        m = TorDaemonManager(probe_ports=["127.0.0.1:9051"], bootstrap_timeout=5)
+        with patch.object(m, "is_healthy", side_effect=[False, False, True]) as h, \
+                patch("duckduckgo_mcp_server.server.time.monotonic", return_value=0.0), \
+                patch("duckduckgo_mcp_server.server.time.sleep"):
+            self.assertTrue(m.wait_for_bootstrap())
+        self.assertGreaterEqual(h.call_count, 3)
+
+    def test_wait_for_bootstrap_returns_false_on_timeout(self):
+        m = TorDaemonManager(probe_ports=["127.0.0.1:9051"], bootstrap_timeout=5)
+        with patch.object(m, "is_healthy", return_value=False), \
+                patch(
+                    "duckduckgo_mcp_server.server.time.monotonic",
+                    side_effect=[0.0, 10.0, 10.0],
+                ), \
+                patch("duckduckgo_mcp_server.server.time.sleep"):
+            self.assertFalse(m.wait_for_bootstrap())
+
+    def test_stop_only_terminates_spawned_pid(self):
+        # service/systemctl runlevel (no spawned_pid) → no-op
+        m1 = TorDaemonManager(probe_ports=["127.0.0.1:9051"])
+        m1._last_runlevel = TorDaemonManager.RUNLEVEL_SERVICE
+        with patch("duckduckgo_mcp_server.server.os.kill") as kill:
+            m1.stop()
+            kill.assert_not_called()
+
+        # spawn runlevel (spawned_pid set) → SIGTERM(15)
+        m2 = TorDaemonManager(probe_ports=["127.0.0.1:9051"])
+        m2._spawned_pid = 99999
+        m2._spawned_tmpdir = None
+        with patch("duckduckgo_mcp_server.server.os.kill") as kill:
+            m2.stop()
+            kill.assert_called_once_with(99999, 15)
+        self.assertIsNone(m2.spawned_pid)
+
+    def test_spawn_torrc_avoids_var_lib_tor_permissions(self):
+        m = TorDaemonManager(probe_ports=["127.0.0.1:9051", "127.0.0.1:9052"])
+        written = {}
+
+        class _FakeFile:
+            def __init__(self, path):
+                self.path = path
+
+            def write(self, content):
+                written[self.path] = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with patch("duckduckgo_mcp_server.server.os.path.exists", return_value=False), \
+                patch("duckduckgo_mcp_server.server.shutil.which", return_value="/usr/sbin/tor"), \
+                patch("duckduckgo_mcp_server.server.subprocess.Popen", return_value=MagicMock(pid=111)), \
+                patch("duckduckgo_mcp_server.server.tempfile.mkdtemp", return_value="/tmp/ddg-tor-torrc"), \
+                patch("duckduckgo_mcp_server.server.os.makedirs"), \
+                patch("builtins.open", lambda p, mode="r": _FakeFile(p)):
+            ok, lvl = m.start()
+        self.assertTrue(ok)
+        self.assertEqual(lvl, TorDaemonManager.RUNLEVEL_SPAWN)
+        content = written["/tmp/ddg-tor-torrc/torrc"]
+        self.assertIn("SocksPort 127.0.0.1:9051", content)
+        self.assertIn("SocksPort 127.0.0.1:9052", content)
+        self.assertIn("DataDirectory /tmp/ddg-tor-torrc/data", content)
+        self.assertIn("Log notice file /tmp/ddg-tor-torrc/tor.log", content)
+        self.assertNotIn("/var/lib/tor", content)
+        self.assertNotIn("/var/log/tor", content)
 

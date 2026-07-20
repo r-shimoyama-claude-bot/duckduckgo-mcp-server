@@ -1,0 +1,38 @@
+# Sample torrc for the DuckDuckGo MCP Server's Onion (Tor) route.
+#
+# Copy to /etc/tor/torrc (or append) and restart Tor:
+#   sudo cp torrc.example /etc/tor/torrc   # or merge into your existing torrc
+#   sudo service tor restart               # (or: sudo systemctl restart tor)
+#
+# Requires tor >= 0.4.7 (older builds can't validate the current directory
+# authority consensus, so no circuits get built).
+#
+# Each SocksPort is an independent Tor circuit. The server's TorPortPool
+# spreads searches across all of them to aggregate bandwidth and reduce
+# per-circuit load — set DDG_TOR_SOCKS_PORTS in .env to match these, and pick
+# DDG_BATCH_CONCURRENCY at roughly 1.5-2x the number of ports.
+#
+# When DDG_AUTO_TOR_START=1 (default) and Tor isn't running at server startup,
+# the server starts it via `service tor start` (which reads this torrc), so no
+# manual start is needed on hosts like WSL2.
+
+SocksPort 9051
+SocksPort 9052
+SocksPort 9053
+SocksPort 9054
+SocksPort 9055
+SocksPort 9056
+SocksPort 9057
+SocksPort 9058
+SocksPort 9059
+
+# Rotate circuits every 5 min (Tor default). Lower is more anonymous but
+# slower; higher reuses circuits longer (faster, slightly less anonymous).
+MaxCircuitDirtiness 300
+
+# Notice-level log to the standard Debian/Ubuntu location. The tor service
+# runs as the debian-tor user, so this path needs no extra setup when started
+# via `service tor start`. (The server's raw-spawn fallback uses its own
+# user-writable log under tempfile, so this line never causes permission
+# errors either way.)
+Log notice file /var/log/tor/notices.log
